@@ -27,7 +27,7 @@ services:
     command: redis-server --port 6379 --requirepass 123456 --appendonly yes
 
   aidea-server:
-    image: mylxsw/aidea-server:1.0.4
+    image: registry.cn-hangzhou.aliyuncs.com/18join/aidea-server:1.0.4
     restart: always
     container_name: aidea-server
     depends_on:
