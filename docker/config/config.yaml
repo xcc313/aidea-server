@@ -31,11 +31,12 @@ sms-channels: [ "aliyun", "tencent" ]
 # 是否启用 OpenAI 代理，依赖于 socks5-proxy 配置
 openai-autoproxy: false
 # OpenAI 服务配置
+enable-openai: true
 openai-organization: ""
 # OpenAI 服务地址，可以配置多个，用于负载均衡
 openai-servers: [ "https://api.openai.com/v1" ]
 # OpenAI API Key，可以配置多个，用于负载均衡
-openai-keys: [ "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" ]
+openai-keys: [ "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" ]
 
 # Azure OpenAI 服务配置
 #openai-azure: true

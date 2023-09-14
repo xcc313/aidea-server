@@ -36,6 +36,8 @@ services:
       - ./docker/config/config.yaml:/etc/aidea.yaml
       - ./docker/config/apple-key.p8:/etc/apple-key.p8
       - ./docker/data/serverdata:/data
+    environment:
+      - "TZ=Asia/Shanghai"
     ports:
       - 8080:8080
 
