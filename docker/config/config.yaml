@@ -139,9 +139,10 @@ storage-callback: "https://ai-api.example.com/v1/callback/storage/qiniu"
 ######## Apple 配置 ########
 
 # 用于提供 Apple 登录、Apple 支付服务
+# https://bark.day.app/#/cert
 
-apple-keyid: "6R3838LWWZ"
-apple-teamid: "HZA1234567"
+apple-keyid: "LH4T9V5U4R"
+apple-teamid: "5U8LBRXG3A"
 apple-secret: /etc/apple-key.p8
 
 ######## 邮件服务器配置 ########
