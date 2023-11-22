@@ -37,9 +37,9 @@ func (chat *OpenAIChat) initRequest(req Request) (*openai.ChatCompletionRequest,
 	}
 
 	// 限制每次请求的最大字数
-	if (req.MaxTokens > 4096 || req.MaxTokens <= 0) && strings.HasPrefix(req.Model, "gpt-4") {
-		req.MaxTokens = 1024
-	}
+	//if (req.MaxTokens > 4096 || req.MaxTokens <= 0) && strings.HasPrefix(req.Model, "gpt-4") {
+	//	req.MaxTokens = 1024
+	//}
 
 	msgs, tokenCount, err := oai.ReduceChatCompletionMessages(
 		contextMessages,
@@ -101,26 +101,40 @@ func (chat *OpenAIChat) ChatStream(ctx context.Context, req Request) (<-chan Res
 	go func() {
 		defer close(res)
 
-		for data := range stream {
-			if data.Code != "" {
-				res <- Response{
-					Error:     data.ErrorMessage,
-					ErrorCode: data.Code,
-				}
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			}
+			case data, ok := <-stream:
+				if !ok {
+					return
+				}
 
-			res <- Response{
-				Text: array.Reduce(
-					data.ChatResponse.Choices,
-					func(carry string, item openai.ChatCompletionStreamChoice) string {
-						return carry + item.Delta.Content
-					},
-					"",
-				),
+				if data.Code != "" {
+					res <- Response{
+						Error:     data.ErrorMessage,
+						ErrorCode: data.Code,
+					}
+					return
+				}
+
+				res <- Response{
+					Text: array.Reduce(
+						data.ChatResponse.Choices,
+						func(carry string, item openai.ChatCompletionStreamChoice) string {
+							return carry + item.Delta.Content
+						},
+						"",
+					),
+				}
 			}
 		}
+
 	}()
 
 	return res, nil
+}
+
+func (chat *OpenAIChat) MaxContextLength(model string) int {
+	return oai.ModelMaxContextSize(model)
 }

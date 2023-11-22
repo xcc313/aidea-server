@@ -15,7 +15,7 @@ import (
 
 func createOpenAIChatClient() chat.Chat {
 	openaiConf := openailib.DefaultConfig(os.Getenv("OPENAI_API_KEY"))
-	openaiConf.HTTPClient.Timeout = 120 * time.Second
+	openaiConf.HTTPClient.Timeout = 300 * time.Second
 	openaiConf.APIType = openailib.APITypeOpenAI
 
 	client := openailib.NewClientWithConfig(openaiConf)
@@ -45,8 +45,11 @@ func TestOpenAIChat_Chat(t *testing.T) {
 
 func TestOpenAIChat_ChatStream(t *testing.T) {
 	chatClient := createOpenAIChatClient()
-	response, err := chatClient.ChatStream(context.TODO(), chat.Request{
-		Model: "gpt-3.5-turbo",
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	response, err := chatClient.ChatStream(ctx, chat.Request{
+		Model: "gpt-4",
 		Messages: []chat.Message{
 			{
 				Role:    "system",

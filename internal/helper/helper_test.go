@@ -15,6 +15,7 @@ func TestIsChinese(t *testing.T) {
 	assert.True(t, helper.IsChinese("中文数据量大English"))
 	assert.False(t, helper.IsChinese("中English"))
 	assert.False(t, helper.IsChinese(""))
+	assert.True(t, helper.IsChinese("钢铁侠"))
 }
 
 func TestParseAppleDateTime(t *testing.T) {
@@ -43,6 +44,7 @@ func TestVersionCompare(t *testing.T) {
 
 	assert.True(t, helper.VersionOlder("1.0.0", "2.0.0"))
 	assert.True(t, helper.VersionOlder("1.0.0", "1.0.1"))
+	assert.False(t, helper.VersionOlder("1.0.6", "1.0.6"))
 }
 
 func TestResolveAspectRadio(t *testing.T) {
@@ -103,4 +105,22 @@ func TestSplitText(t *testing.T) {
 	for _, line := range helper.TextSplit("这个世界也太方框了啊，123456，abcdefg", 10) {
 		fmt.Println(line)
 	}
+}
+
+func TestTodayRemainTimeSeconds(t *testing.T) {
+	fmt.Println(helper.TodayRemainTimeSeconds())
+}
+
+func TestWordCount(t *testing.T) {
+	assert.EqualValues(t, 5, helper.WordCount("hello"))
+	assert.EqualValues(t, 4, helper.WordCount("逍遥神剑"))
+	assert.EqualValues(t, 12, len("逍遥神剑"))
+}
+
+func TestWordTruncate(t *testing.T) {
+	assert.EqualValues(t, "逍遥神剑", helper.WordTruncate("逍遥神剑", 4))
+	assert.EqualValues(t, "逍遥神", helper.WordTruncate("逍遥神剑", 3))
+	assert.EqualValues(t, "逍", helper.WordTruncate("逍遥神剑", 1))
+	assert.EqualValues(t, "", helper.WordTruncate("逍遥神剑", 0))
+	assert.EqualValues(t, "逍遥神剑", helper.WordTruncate("逍遥神剑", 5))
 }

@@ -1,5 +1,7 @@
 # 部署指南
 
+> 建议大家尽可能的自己去部署，遇到问题在 [GitHub Issues](https://github.com/mylxsw/aidea-server/issues) 提出，如果实在懒得搞，可以找我来帮你部署，详情参考 [服务器代部署说明](./deploy-vip.md)。
+> 
 > 由于时间仓促，文档可能尚未详尽，我将在后续逐步补充详细的说明文档。
 
 ## 架构草图
@@ -7,6 +9,8 @@
 ![image](https://github.com/mylxsw/aidea-server/assets/2330911/ffb59bb3-46d7-4fe6-a777-b409acff17e2)
 
 ## 项目依赖
+
+![image](https://github.com/mylxsw/aidea-server/assets/2330911/43c095f5-4964-46c7-8c50-9b44b6d36fef)
 
 必选依赖
 
@@ -31,7 +35,7 @@
     - 腾讯云短信服务
 - 内容安全检测（使用阿里云的内容安全服务，用于检测提示语中是否包含敏感词汇）
 - 有道翻译 API 接口（翻译功能、文生图及图生图提示语中文转英文）
-- 百度文心千帆大模型 Keys，支持以下模型
+- 百度文心千帆大模型 Keys，支持以下模型 【[开通指南](https://github.com/mylxsw/aidea-server/wiki/百度文心千帆服务开通指南)】
     - model_ernie_bot_turbo
     - model_ernie_bot
 - 阿里灵积平台模型 Keys，支持以下模型
@@ -39,11 +43,15 @@
 - 讯飞星火大语言模型 Keys，支持以下模型
     - general
     - generalv2
+- Anthropic API Keys，支持以下模型
+    - claude-instant
+    - cluade-2.0
 - [DeepAI](https://deepai.org/) 平台 Keys，用于图片超分辨率、上色
 - [Stability AI](https://stability.ai/) Stable Diffusion 官方提供的 API，用于 SDXL 1.0  模型文生图、图生图
 - [Leap](https://tryleap.ai/) 平台 Keys，用于 Leap 平台提供的文生图、图生图模型
 - [Fromston](https://fromston.6pen.art/) 国内 6pen 团队提供的 Keys，用于文生图、图生图模型
 - [getimg.ai](https://getimg.ai/tools/api) 平台 Keys，用于文生图、图生图模型
+- [支付宝在线支付](./alipay-configuration.md)
 
 ## 部署步骤
 
@@ -55,20 +63,10 @@
 
 ```bash
 mysql> CREATE DATABASE aidea_server CHARSET utf8mb4;
-Query OK, 1 row affected (0.04 sec)
-
 mysql> USE aidea_server;
-Database changed
-
 mysql> SOURCE /Users/mylxsw/Workspace/codes/ai/ai-server/migrate/2023090801-ddl.sql;
-Query OK, 0 rows affected (0.00 sec)
-...
-Query OK, 0 rows affected (0.31 sec)
-
 mysql> SOURCE /Users/mylxsw/Workspace/codes/ai/ai-server/migrate/2023090802-dml.sql;
-Query OK, 0 rows affected (0.00 sec)
-...
-Query OK, 1 row affected (0.00 sec)
+mysql> SOURCE /Users/mylxsw/Workspace/codes/ai/ai-server/migrate/2023092501-dml.sql;
 ```
 
 ### 2. 创建配置文件
@@ -108,9 +106,4 @@ Query OK, 1 row affected (0.00 sec)
     ```
 5. 我不想自己安装，能否帮我部署一套？
     
-    建议大家尽可能的自己去部署，遇到问题在 [GitHub Issues](https://github.com/mylxsw/aidea-server/issues) 提出，如果实在懒得搞，可以找我来帮你部署，但是需要收费，费用暂定为 1000 RMB/次，如果有需要可以联系我，微信号：mylxsw。你需要自己准备以下资源
-    - 应用服务器（建议内存 1G 以上）
-    - MySQL 8.0+ 
-    - Redis 7.0+
-    - [项目依赖](#项目依赖) 中提到的第三方服务，我可以告诉你怎么去申请，因为涉及到给第三方服务付款以及实名认证等问题，还是要你自己去申请。
-   
+    建议大家尽可能的自己去部署，遇到问题在 [GitHub Issues](https://github.com/mylxsw/aidea-server/issues) 提出，如果实在懒得搞，可以找我来帮你部署，详情参考 [服务器代部署说明](./deploy-vip.md)。

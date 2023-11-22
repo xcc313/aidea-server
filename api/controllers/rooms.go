@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"errors"
+	"github.com/mylxsw/aidea-server/internal/ai/chat"
 	"net/http"
 	"strconv"
 	"strings"
@@ -65,7 +66,13 @@ func (ctl *RoomController) Galleries(ctx context.Context, webCtx web.Context, cl
 		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
+	cnLocalMode := client.IsCNLocalMode(ctl.conf)
 	rooms = array.Filter(rooms, func(item repo.GalleryRoom, _ int) bool {
+		// 如果启用了国产化模式，则过滤掉 openai 和 Anthropic 的模型
+		if cnLocalMode && item.RoomType == "system" && array.In(item.Vendor, []string{"openai", "Anthropic"}) {
+			return false
+		}
+
 		// 检查模型是否满足条件
 		if !ctl.conf.EnableOpenAI && item.Vendor == "openai" {
 			return false
@@ -80,6 +87,26 @@ func (ctl *RoomController) Galleries(ctx context.Context, webCtx web.Context, cl
 		}
 
 		if !ctl.conf.EnableXFYunAI && item.Vendor == "讯飞星火" {
+			return false
+		}
+
+		if !ctl.conf.EnableSenseNovaAI && item.Vendor == "商汤日日新" {
+			return false
+		}
+
+		if !ctl.conf.EnableTencentAI && item.Vendor == "腾讯" {
+			return false
+		}
+
+		if !ctl.conf.EnableAnthropic && item.Vendor == "Anthropic" {
+			return false
+		}
+
+		if !ctl.conf.EnableBaichuan && item.Vendor == "百川" {
+			return false
+		}
+
+		if !ctl.conf.EnableGPT360 && item.Vendor == "360智脑" {
 			return false
 		}
 
@@ -106,7 +133,7 @@ func (ctl *RoomController) Galleries(ctx context.Context, webCtx web.Context, cl
 
 	showTags = array.Uniq(showTags)
 
-	tags := []string{"全部", "大模型", "职场", "学习", "娱乐", "世界名人", "创意创作", "生活"}
+	tags := []string{"全部", "大模型", "职场", "学习", "娱乐", "世界名人", "创意生活"}
 	tags = array.Filter(tags, func(item string, index int) bool {
 		return array.In(item, showTags)
 	})
@@ -140,7 +167,7 @@ func (ctl *RoomController) GalleryItem(ctx context.Context, webCtx web.Context) 
 }
 
 // CopyGalleryItem 用户选择数字人，本地复制一份
-func (ctl *RoomController) CopyGalleryItem(ctx context.Context, webCtx web.Context, user *auth.User) web.Response {
+func (ctl *RoomController) CopyGalleryItem(ctx context.Context, webCtx web.Context, user *auth.User, client *auth.ClientInfo) web.Response {
 	idsStr := strings.Split(webCtx.Input(`ids`), ",")
 	ids := array.Filter(
 		array.Map(
@@ -158,10 +185,17 @@ func (ctl *RoomController) CopyGalleryItem(ctx context.Context, webCtx web.Conte
 		return webCtx.JSONError("invalid ids", http.StatusBadRequest)
 	}
 
+	// TODO 实时查询，而不是每次全部查询出来再判断是否满足条件，前期内置数字人数量少没关系
 	rooms, err := ctl.roomRepo.Galleries(ctx)
 	if err != nil {
 		log.Errorf("query rooms galleries failed: %v", err)
 		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+	}
+
+	// 启用国产化模式时，如果内置的模型为 GPT 系列，替换为国产模型
+	var replaceVendor, replaceModel string
+	if client.IsCNLocalMode(ctl.conf) {
+		replaceVendor, replaceModel = ctl.conf.CNLocalVendor, ctl.conf.CNLocalModel
 	}
 
 	for _, item := range rooms {
@@ -169,10 +203,18 @@ func (ctl *RoomController) CopyGalleryItem(ctx context.Context, webCtx web.Conte
 			continue
 		}
 
+		vendor := item.Vendor
+		mod := item.Model
+
+		// 如果替换模型和服务商不为空，则替换当前 Room 的模型为国产化模型
+		if array.In(strings.ToLower(vendor), []string{"openai", "anthropic"}) && replaceVendor != "" && replaceModel != "" {
+			vendor, mod = replaceVendor, replaceModel
+		}
+
 		if _, err := ctl.roomRepo.Create(ctx, user.ID, &model.Rooms{
 			Name:           item.Name,
-			Model:          item.Model,
-			Vendor:         item.Vendor,
+			Model:          mod,
+			Vendor:         vendor,
 			SystemPrompt:   item.Prompt,
 			MaxContext:     item.MaxContext,
 			RoomType:       repo.RoomTypePreset,
@@ -181,7 +223,7 @@ func (ctl *RoomController) CopyGalleryItem(ctx context.Context, webCtx web.Conte
 			AvatarUrl:      item.AvatarUrl,
 			LastActiveTime: time.Now(),
 		}, true); err != nil {
-			if err == repo.ErrRoomNameExists {
+			if errors.Is(err, repo.ErrRoomNameExists) {
 				continue
 			}
 
@@ -226,7 +268,7 @@ func (ctl *RoomController) CreateRoom(ctx context.Context, webCtx web.Context, u
 		InitMessage:    req.InitMessage,
 	}
 
-	id, err := ctl.roomRepo.Create(ctx, user.ID, &room, false)
+	id, err := ctl.roomRepo.Create(ctx, user.ID, &room, true)
 	if err != nil {
 		if err == repo.ErrRoomNameExists {
 			return webCtx.JSONError(common.Text(webCtx, ctl.translater, "数字人名称已存在"), http.StatusBadRequest)
@@ -242,8 +284,13 @@ func (ctl *RoomController) CreateRoom(ctx context.Context, webCtx web.Context, u
 }
 
 // Rooms 获取用户的数字人列表
-func (ctl *RoomController) Rooms(ctx context.Context, webCtx web.Context, user *auth.User) web.Response {
-	rooms, err := ctl.roomRepo.Rooms(ctx, user.ID, RoomsQueryLimit)
+func (ctl *RoomController) Rooms(ctx context.Context, webCtx web.Context, user *auth.User, client *auth.ClientInfo) web.Response {
+	roomTypes := []int{repo.RoomTypePreset, repo.RoomTypePresetCustom, repo.RoomTypeCustom}
+	if helper.VersionNewer(client.Version, "1.0.6") {
+		roomTypes = append(roomTypes, repo.RoomTypeGroupChat)
+	}
+
+	rooms, err := ctl.roomRepo.Rooms(ctx, user.ID, roomTypes, RoomsQueryLimit)
 	if err != nil {
 		log.F(log.M{"user_id": user.ID}).Errorf("查询用户房间列表失败: %v", err)
 		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
@@ -275,12 +322,21 @@ func (ctl *RoomController) Room(ctx context.Context, webCtx web.Context, user *a
 
 	room, err := ctl.roomRepo.Room(ctx, user.ID, int64(roomID))
 	if err != nil {
-		if err == repo.ErrNotFound {
+		if errors.Is(err, repo.ErrNotFound) {
 			return webCtx.JSONError(common.Text(webCtx, ctl.translater, "数字人不存在"), http.StatusNotFound)
 		}
 
 		log.F(log.M{"user_id": user.ID, "room_id": roomID}).Errorf("查询用户房间失败: %v", err)
 		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+	}
+
+	if room.AvatarUrl == "" {
+		for _, mod := range chat.Models(ctl.conf, true) {
+			if mod.RealID() == room.Model {
+				room.AvatarUrl = mod.AvatarURL
+				break
+			}
+		}
 	}
 
 	return webCtx.JSON(room)
@@ -364,13 +420,7 @@ func (ctl *RoomController) parseRoomRequest(webCtx web.Context, isUpdate bool) (
 
 	req.Model = modelId
 
-	vendor := webCtx.Input("vendor")
-	if !array.In(vendor, []string{"openai", "baidu", "aliyun", "百度", "阿里", "文心千帆", "灵积", "讯飞星火"}) {
-		return nil, errors.New("不支持该类型的模型")
-	}
-
-	req.Vendor = vendor
-
+	req.Vendor = webCtx.Input("vendor")
 	systemPrompt := webCtx.Input("system_prompt")
 	if utf8.RuneCountInString(systemPrompt) > 1000 {
 		return nil, errors.New("系统提示不能超过 1000 个字符")
@@ -399,7 +449,7 @@ func (ctl *RoomController) UpdateRoom(ctx context.Context, webCtx web.Context, u
 
 	room, err := ctl.roomRepo.Room(ctx, user.ID, int64(req.RoomID))
 	if err != nil {
-		if err == repo.ErrNotFound {
+		if errors.Is(err, repo.ErrNotFound) {
 			return webCtx.JSONError(common.Text(webCtx, ctl.translater, "数字人不存在"), http.StatusNotFound)
 		}
 
@@ -426,9 +476,8 @@ func (ctl *RoomController) UpdateRoom(ctx context.Context, webCtx web.Context, u
 		changed = true
 	}
 
-	if req.AvatarURL != room.AvatarUrl && req.AvatarURL != "" {
+	if req.AvatarURL != room.AvatarUrl {
 		room.AvatarUrl = req.AvatarURL
-		room.AvatarId = 0
 		changed = true
 	}
 

@@ -79,14 +79,14 @@ type Properties map[string]Parameter
 
 func TestPromptFunctionRequest(t *testing.T) {
 	openaiConf := openailib.DefaultConfig(os.Getenv("OPENAI_API_KEY"))
-	openaiConf.HTTPClient.Timeout = 120 * time.Second
+	openaiConf.HTTPClient.Timeout = 300 * time.Second
 	openaiConf.APIType = openailib.APITypeOpenAI
 
 	client := openailib.NewClientWithConfig(openaiConf)
 
 	resp, err := client.CreateChatCompletion(context.TODO(), openailib.ChatCompletionRequest{
 		MaxTokens: 500,
-		Model:     "gpt-3.5-turbo-0613",
+		Model:     "gpt-3.5-turbo",
 		Messages: []openailib.ChatCompletionMessage{
 			{Role: "system", Content: prompt},
 			{Role: "user", Content: "奔跑的蜗牛"},

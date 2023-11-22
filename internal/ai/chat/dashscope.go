@@ -83,7 +83,7 @@ func (ds *DashScopeChat) initRequest(req Request) dashscope.ChatRequest {
 
 func (ds *DashScopeChat) Chat(ctx context.Context, req Request) (*Response, error) {
 	chatReq := ds.initRequest(req)
-	resp, err := ds.dashscope.Chat(chatReq)
+	resp, err := ds.dashscope.Chat(ctx, chatReq)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +100,7 @@ func (ds *DashScopeChat) Chat(ctx context.Context, req Request) (*Response, erro
 }
 
 func (ds *DashScopeChat) ChatStream(ctx context.Context, req Request) (<-chan Response, error) {
-	stream, err := ds.dashscope.ChatStream(ds.initRequest(req))
+	stream, err := ds.dashscope.ChatStream(ctx, ds.initRequest(req))
 	if err != nil {
 		return nil, err
 	}
@@ -110,24 +110,47 @@ func (ds *DashScopeChat) ChatStream(ctx context.Context, req Request) (<-chan Re
 		defer close(res)
 
 		var lastMessage string
-		for data := range stream {
-			if data.Code != "" {
-				res <- Response{
-					Error:     data.Message,
-					ErrorCode: data.Code,
-				}
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			}
+			case data, ok := <-stream:
+				if !ok {
+					return
+				}
 
-			res <- Response{
-				Text:         strings.TrimPrefix(data.Output.Text, lastMessage),
-				InputTokens:  data.Usage.InputTokens,
-				OutputTokens: data.Usage.OutputTokens,
-			}
+				if data.Code != "" {
+					select {
+					case <-ctx.Done():
+					case res <- Response{Error: data.Message, ErrorCode: data.Code}:
+					}
+					return
+				}
 
-			lastMessage = data.Output.Text
+				select {
+				case <-ctx.Done():
+					return
+				case res <- Response{
+					Text:         strings.TrimPrefix(data.Output.Text, lastMessage),
+					InputTokens:  data.Usage.InputTokens,
+					OutputTokens: data.Usage.OutputTokens,
+				}:
+				}
+
+				lastMessage = data.Output.Text
+			}
 		}
 	}()
 
 	return res, nil
+}
+
+func (ds *DashScopeChat) MaxContextLength(model string) int {
+	switch model {
+	case dashscope.ModelQWenV1, dashscope.ModelQWenTurbo, dashscope.ModelQWenPlusV1, dashscope.ModelQWenPlus:
+		// https://help.aliyun.com/zh/dashscope/developer-reference/api-details?disableWebsiteRedirect=true
+		return 6000
+	}
+
+	return 4000
 }

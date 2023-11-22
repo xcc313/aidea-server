@@ -3,6 +3,7 @@ package v2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -32,8 +33,7 @@ import (
 )
 
 const (
-	AllInOneIslandID            = "all-in-one"
-	DefaultImageCompletionModel = "sb-stable-diffusion-xl-1024-v1-0"
+	AllInOneIslandID = "all-in-one"
 )
 
 // CreativeIslandController 创作岛
@@ -41,7 +41,7 @@ type CreativeIslandController struct {
 	conf         *config.Config
 	quotaRepo    *repo.QuotaRepo          `autowire:"@"`
 	queue        *queue.Queue             `autowire:"@"`
-	translater   youdao.Translater        `autowire:"@"`
+	trans        youdao.Translater        `autowire:"@"`
 	creativeRepo *repo.CreativeRepo       `autowire:"@"`
 	securitySrv  *service.SecurityService `autowire:"@"`
 }
@@ -87,6 +87,8 @@ type CreativeIslandItem struct {
 	TitleColor   string `json:"title_color,omitempty"`
 	PreviewImage string `json:"preview_image,omitempty"`
 	RouteURI     string `json:"route_uri,omitempty"`
+	Tag          string `json:"tag,omitempty"`
+	Note         string `json:"note,omitempty"`
 }
 
 func (ctl *CreativeIslandController) Items(ctx context.Context, webCtx web.Context, client *auth.ClientInfo) web.Response {
@@ -104,16 +106,18 @@ func (ctl *CreativeIslandController) Items(ctx context.Context, webCtx web.Conte
 			TitleColor:   "FFFFFFFF",
 			PreviewImage: "https://ssl.aicode.cc/ai-server/assets/background/image-image-to-image.jpeg-thumb1000",
 			RouteURI:     "/creative-draw/create?mode=image-to-image&id=image-to-image",
+			Tag:          ternary.If(client != nil && client.IsIOS(), "", "BETA"),
 		},
 	}
 
 	if client != nil && helper.VersionNewer(client.Version, "1.0.2") && ctl.conf.EnableDeepAI {
 		items = append(items, CreativeIslandItem{
 			ID:           "image-upscale",
-			Title:        "超分辨率",
+			Title:        "高清修复",
 			TitleColor:   "FFFFFFFF",
 			PreviewImage: "https://ssl.aicode.cc/ai-server/assets/background/super-res.jpeg-thumb1000",
 			RouteURI:     "/creative-draw/create-upscale",
+			Note:         "图片的高清修复功能能够把低分辨率的照片升级到高分辨率，让图片的清晰度得到明显提升。",
 		})
 
 		items = append(items, CreativeIslandItem{
@@ -122,6 +126,7 @@ func (ctl *CreativeIslandController) Items(ctx context.Context, webCtx web.Conte
 			TitleColor:   "FFFFFFFF",
 			PreviewImage: "https://ssl.aicode.cc/ai-server/assets/background/image-colorizev2.jpeg-thumb1000",
 			RouteURI:     "/creative-draw/create-colorize",
+			Note:         "图片上色功能能够把黑白照片变成彩色照片，让照片的色彩更加丰富。",
 		})
 	}
 
@@ -177,6 +182,10 @@ func (ctl *CreativeIslandController) loadAllModels(ctx context.Context) []repo.I
 			return ctl.conf.EnableGetimgAI
 		}
 
+		if m.Vendor == "dashscope" {
+			return ctl.conf.EnableDashScopeAI
+		}
+
 		return true
 	})
 }
@@ -220,19 +229,39 @@ func (ctl *CreativeIslandController) Capacity(ctx context.Context, webCtx web.Co
 
 	filters := array.Sort(
 		array.Filter(ctl.getAllImageStyles(ctx), func(item ImageStyle, index int) bool {
+			if !ctl.conf.EnableLeapAI && item.Vendor == "leapai" {
+				return false
+			}
+
+			if !ctl.conf.EnableStabilityAI && item.Vendor == "stabilityai" {
+				return false
+			}
+
+			if !ctl.conf.EnableFromstonAI && item.Vendor == "fromston" {
+				return false
+			}
+
+			if !ctl.conf.EnableGetimgAI && item.Vendor == "getimgai" {
+				return false
+			}
+
 			return str.In(mode, item.Supports)
 		}),
 		func(f1, f2 ImageStyle) bool { return sortorder.NaturalLess(f1.Name, f2.Name) },
 	)
 
 	var models []VendorModel
-	if user.InternalUser() && user.WithLab {
+	if user.InternalUser() {
 		models = array.Sort(array.Filter(ctl.getAllModels(ctx), func(v VendorModel, _ int) bool { return v.Enabled }), func(v1, v2 VendorModel) bool {
-			return sortorder.NaturalLess(v1.Name, v2.Name)
+			if v1.Vendor == v2.Vendor {
+				return sortorder.NaturalLess(v1.Name, v2.Name)
+			}
+
+			return sortorder.NaturalLess(v1.Vendor, v2.Vendor)
 		})
 
 		models = array.Map(models, func(item VendorModel, _ int) VendorModel {
-			if !user.InternalUser() || !user.WithLab {
+			if !user.InternalUser() {
 				item.Vendor = ""
 			}
 
@@ -246,13 +275,13 @@ func (ctl *CreativeIslandController) Capacity(ctx context.Context, webCtx web.Co
 		AllowRatios:              []string{"1:1" /*"4:3", "3:4",*/, "3:2", "2:3" /*"16:9"*/},
 		ShowStyle:                true,
 		ShowNegativeText:         true,
-		ShowSeed:                 user.InternalUser() && user.WithLab,
-		ShowImageCount:           user.InternalUser() && user.WithLab,
+		ShowSeed:                 user.InternalUser(),
+		ShowImageCount:           user.InternalUser(),
 		ShowPromptForImage2Image: true,
 		Filters:                  filters,
 		VendorModels:             models,
 		AllowUpscaleBy:           []string{"x1", "x2", "x4"},
-		ShowImageStrength:        true,
+		ShowImageStrength:        user.InternalUser(),
 	})
 }
 
@@ -260,20 +289,20 @@ func (ctl *CreativeIslandController) Capacity(ctx context.Context, webCtx web.Co
 func (ctl *CreativeIslandController) ShareHistoryItem(ctx context.Context, webCtx web.Context, user *auth.User) web.Response {
 	hid, _ := strconv.Atoi(webCtx.PathVar("hid"))
 	if hid <= 0 {
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInvalidRequest), http.StatusBadRequest)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInvalidRequest), http.StatusBadRequest)
 	}
 
 	err := ctl.creativeRepo.ShareCreativeHistoryToGallery(ctx, user.ID, user.Name, int64(hid))
 	if err != nil {
-		if err == repo.ErrNotFound {
-			return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrNotFound), http.StatusNotFound)
+		if errors.Is(err, repo.ErrNotFound) {
+			return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrNotFound), http.StatusNotFound)
 		}
 
 		log.WithFields(log.Fields{
 			"uid":    user.ID,
 			"his_id": hid,
 		}).Errorf("share creative item failed: %v", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	return webCtx.JSON(web.M{})
@@ -283,16 +312,21 @@ func (ctl *CreativeIslandController) ShareHistoryItem(ctx context.Context, webCt
 func (ctl *CreativeIslandController) CancelShareHistoryItem(ctx context.Context, webCtx web.Context, user *auth.User) web.Response {
 	hid, _ := strconv.Atoi(webCtx.PathVar("hid"))
 	if hid <= 0 {
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInvalidRequest), http.StatusBadRequest)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInvalidRequest), http.StatusBadRequest)
 	}
 
-	err := ctl.creativeRepo.CancelCreativeHistoryShare(ctx, user.ID, int64(hid))
+	userID := user.ID
+	if user.InternalUser() {
+		userID = 0
+	}
+
+	err := ctl.creativeRepo.CancelCreativeHistoryShare(ctx, userID, int64(hid))
 	if err != nil {
 		log.WithFields(log.Fields{
 			"uid":    user.ID,
 			"his_id": hid,
 		}).Errorf("cancel share creative item failed: %v", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	return webCtx.JSON(web.M{})
@@ -318,7 +352,7 @@ func (ctl *CreativeIslandController) Histories(ctx context.Context, webCtx web.C
 	})
 	if err != nil {
 		log.Errorf("query creative items failed: %v", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	// 以下字段不需要返回给前端
@@ -351,9 +385,14 @@ func (ctl *CreativeIslandController) Histories(ctx context.Context, webCtx web.C
 				item.IslandTitle = "文生图"
 			}
 		case int64(repo.IslandTypeUpscale):
-			item.IslandTitle = "超分辨率"
+			item.IslandTitle = "高清修复"
 		case int64(repo.IslandTypeImageColorization):
 			item.IslandTitle = "图片上色"
+		}
+
+		// 客户端目前不支持封禁状态展示，这里转换为失败
+		if item.Status == int64(repo.CreativeStatusForbid) {
+			item.Status = int64(repo.CreativeStatusFailed)
 		}
 
 		return item
@@ -385,22 +424,32 @@ type CreativeHistoryItemResp struct {
 func (ctl *CreativeIslandController) HistoryItem(ctx context.Context, webCtx web.Context, user *auth.User) web.Response {
 	hid, _ := strconv.Atoi(webCtx.PathVar("hid"))
 	if hid <= 0 {
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInvalidRequest), http.StatusBadRequest)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInvalidRequest), http.StatusBadRequest)
 	}
 
-	item, err := ctl.creativeRepo.FindHistoryRecord(ctx, user.ID, int64(hid))
+	userId := user.ID
+	if user.InternalUser() {
+		userId = 0
+	}
+
+	item, err := ctl.creativeRepo.FindHistoryRecord(ctx, userId, int64(hid))
 	if err != nil {
-		if err == repo.ErrNotFound {
-			return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrNotFound), http.StatusNotFound)
+		if errors.Is(err, repo.ErrNotFound) {
+			return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrNotFound), http.StatusNotFound)
 		}
 
 		log.Errorf("query creative item failed: %v", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
+	}
+
+	// 客户端目前不支持封禁状态展示，这里转换为失败
+	if item.Status == int64(repo.CreativeStatusForbid) {
+		item.Status = int64(repo.CreativeStatusFailed)
 	}
 
 	return webCtx.JSON(CreativeHistoryItemResp{
 		CreativeHistoryItem: *item,
-		ShowBetaFeature:     user.InternalUser() && user.WithLab,
+		ShowBetaFeature:     user.InternalUser(),
 	})
 }
 
@@ -408,7 +457,7 @@ func (ctl *CreativeIslandController) HistoryItem(ctx context.Context, webCtx web
 func (ctl *CreativeIslandController) DeleteHistoryItem(ctx context.Context, webCtx web.Context, user *auth.User) web.Response {
 	hid, _ := strconv.Atoi(webCtx.PathVar("hid"))
 	if hid <= 0 {
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInvalidRequest), http.StatusBadRequest)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInvalidRequest), http.StatusBadRequest)
 	}
 
 	log.WithFields(log.Fields{
@@ -418,18 +467,18 @@ func (ctl *CreativeIslandController) DeleteHistoryItem(ctx context.Context, webC
 
 	if err := ctl.creativeRepo.DeleteHistoryRecord(ctx, user.ID, int64(hid)); err != nil {
 		log.Errorf("delete creative item failed: %v", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	return webCtx.JSON(web.M{})
 }
 
 // CompletionsEvaluate 创作岛项目文本生成 价格评估
-func (ctl *CreativeIslandController) CompletionsEvaluate(ctx context.Context, webCtx web.Context, user *auth.User) web.Response {
+func (ctl *CreativeIslandController) CompletionsEvaluate(ctx context.Context, webCtx web.Context, user *auth.User, client *auth.ClientInfo) web.Response {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	req, errResp := ctl.resolveImageCompletionRequest(ctx, webCtx, user)
+	req, errResp := ctl.resolveImageCompletionRequest(ctx, webCtx, user, client)
 	if errResp != nil {
 		return errResp
 	}
@@ -438,7 +487,7 @@ func (ctl *CreativeIslandController) CompletionsEvaluate(ctx context.Context, we
 	quota, err := ctl.quotaRepo.GetUserQuota(ctx, user.ID)
 	if err != nil {
 		log.Errorf("get user quota failed: %s", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	if !user.InternalUser() {
@@ -449,7 +498,7 @@ func (ctl *CreativeIslandController) CompletionsEvaluate(ctx context.Context, we
 }
 
 // resolveImageCompletionRequest 解析创作岛项目图片生成请求参数
-func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.Context, webCtx web.Context, user *auth.User) (*queue.ImageCompletionPayload, web.Response) {
+func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.Context, webCtx web.Context, user *auth.User, client *auth.ClientInfo) (*queue.ImageCompletionPayload, web.Response) {
 	image := webCtx.Input("image")
 	if image != "" && !str.HasPrefixes(image, []string{"http://", "https://"}) {
 		return nil, webCtx.JSONError("invalid image", http.StatusBadRequest)
@@ -477,7 +526,7 @@ func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.C
 		return nil, webCtx.JSONError("invalid image count", http.StatusBadRequest)
 	}
 
-	steps := webCtx.IntInput("steps", 50)
+	steps := webCtx.IntInput("steps", 30)
 	if !array.In(steps, []int{30, 50, 100, 150}) {
 		return nil, webCtx.JSONError("invalid steps", http.StatusBadRequest)
 	}
@@ -489,11 +538,6 @@ func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.C
 		aiRewrite = false
 	}
 
-	mode := webCtx.InputWithDefault("mode", "canny")
-	if !array.In(mode, []string{"canny", "mlsd", "pose", "scribble"}) {
-		mode = "canny"
-	}
-
 	upscaleBy := webCtx.InputWithDefault("upscale_by", "x1")
 	if !array.In(upscaleBy, []string{"x1", "x2", "x4"}) {
 		return nil, webCtx.JSONError("invalid upscale_by", http.StatusBadRequest)
@@ -501,9 +545,12 @@ func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.C
 
 	stylePreset := webCtx.Input("style_preset")
 
-	modelID := webCtx.InputWithDefault("model", DefaultImageCompletionModel)
+	modelID := webCtx.InputWithDefault(
+		"model",
+		ternary.If(image != "", ctl.conf.DefaultImageToImageModel, ctl.conf.DefaultTextToImageModel),
+	)
 	filterID := webCtx.Int64Input("filter_id", 0)
-	var filterName string
+	var filterName, defaultFilterMode string
 	if filterID > 0 {
 		filter := ctl.getStyleByID(ctx, filterID)
 		if filter == nil {
@@ -512,6 +559,7 @@ func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.C
 
 		modelID = filter.ModelID
 		filterName = filter.Name
+		defaultFilterMode = filter.Mode
 	} else {
 		// 如果没有指定 filter， 则自动根据模型补充 filter 信息
 		mode := ternary.If(image != "", "image-to-image", "text-to-image")
@@ -519,17 +567,28 @@ func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.C
 		if filter != nil {
 			filterID = filter.ID
 			filterName = filter.Name
+			defaultFilterMode = filter.Mode
 		}
 	}
 
 	vendorModel := ctl.getVendorModel(ctx, modelID)
 	if vendorModel == nil {
-		return nil, webCtx.JSONError("invalid model", http.StatusBadRequest)
+		return nil, webCtx.JSONError("没有找到匹配的模型", http.StatusBadRequest)
 	}
 
 	imageRatio := webCtx.InputWithDefault("image_ratio", "1:1")
 	if !array.In(imageRatio, []string{"1:1", "4:3", "3:4", "3:2", "2:3", "16:9"}) {
 		return nil, webCtx.JSONError("invalid image ratio", http.StatusBadRequest)
+	}
+
+	// 图生图模式下有效（ControlNet）
+	if defaultFilterMode == "" {
+		defaultFilterMode = "canny"
+	}
+
+	mode := webCtx.InputWithDefault("mode", defaultFilterMode)
+	if !array.In(mode, []string{"canny", "mlsd", "pose", "scribble"}) {
+		mode = defaultFilterMode
 	}
 
 	// 根据模型配置，自动调整相关参数（width/height）
@@ -540,13 +599,18 @@ func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.C
 		return nil, webCtx.JSONError("invalid width or height", http.StatusBadRequest)
 	}
 
-	imageStrength := webCtx.Float64Input("image_strength", 0.5)
+	imageStrength := webCtx.Float64Input("image_strength", 0.65)
 	if imageStrength < 0 || imageStrength > 1 {
 		return nil, webCtx.JSONError("invalid image_strength", http.StatusBadRequest)
 	}
 
 	if imageStrength == 0 {
-		imageStrength = 0.5
+		imageStrength = 0.65
+	}
+
+	// TODO 临时处理：0.5 效果不明显，但是客户端默认为 0.5，需要客户端同步调整
+	if imageStrength == 0.5 && helper.VersionOlder(client.Version, "1.0.7") {
+		imageStrength = 0.65
 	}
 
 	seed := webCtx.Int64Input("seed", int64(rand.Intn(2147483647)))
@@ -569,7 +633,7 @@ func (ctl *CreativeIslandController) resolveImageCompletionRequest(ctx context.C
 		UpscaleBy:      upscaleBy,
 		StylePreset:    stylePreset,
 		Seed:           seed,
-		ImageStrength:  1.0 - imageStrength,
+		ImageStrength:  imageStrength,
 		FilterID:       filterID,
 		FilterName:     filterName,
 		GalleryCopyID:  webCtx.Int64Input("gallery_copy_id", 0),
@@ -617,7 +681,9 @@ type ImageStyle struct {
 	Name           string   `json:"name,omitempty"`
 	PreviewImage   string   `json:"preview_image,omitempty"`
 	Description    string   `json:"description,omitempty"`
+	Mode           string   `json:"mode,omitempty"`
 	ModelID        string   `json:"-"`
+	Vendor         string   `json:"-"`
 	Prompt         string   `json:"-"`
 	NegativePrompt string   `json:"-"`
 	Supports       []string `json:"-"`
@@ -637,9 +703,11 @@ func (ctl *CreativeIslandController) getAllImageStyles(ctx context.Context) []Im
 			PreviewImage:   f.PreviewImage,
 			Description:    f.Description,
 			ModelID:        f.ModelId,
+			Mode:           f.ImageMeta.Mode,
 			Prompt:         f.ImageMeta.Prompt,
 			NegativePrompt: f.ImageMeta.NegativePrompt,
 			Supports:       f.ImageMeta.Supports,
+			Vendor:         f.Vendor,
 		}
 	})
 }
@@ -690,26 +758,26 @@ type VendorModel struct {
 	ShowStyle         bool                      `json:"show_style,omitempty"`
 	ShowImageStrength bool                      `json:"show_image_strength,omitempty"`
 	IntroURL          string                    `json:"intro_url,omitempty"`
-	RatioDimensions   map[string]repo.Dimension `json:"–"`
+	RatioDimensions   map[string]repo.Dimension `json:"-"`
 }
 
 func (vm VendorModel) defaultDimension(ratio string) repo.Dimension {
 	switch ratio {
 	case "1:1":
-		return repo.Dimension{512, 512}
+		return repo.Dimension{Width: 512, Height: 512}
 	case "4:3":
-		return repo.Dimension{768, 576}
+		return repo.Dimension{Width: 768, Height: 576}
 	case "3:4":
-		return repo.Dimension{576, 768}
+		return repo.Dimension{Width: 576, Height: 768}
 	case "3:2":
-		return repo.Dimension{768, 512}
+		return repo.Dimension{Width: 768, Height: 512}
 	case "2:3":
-		return repo.Dimension{512, 768}
+		return repo.Dimension{Width: 512, Height: 768}
 	case "16:9":
-		return repo.Dimension{1024, 576}
+		return repo.Dimension{Width: 1024, Height: 576}
 	}
 
-	return repo.Dimension{512, 512}
+	return repo.Dimension{Width: 512, Height: 512}
 }
 
 func (vm VendorModel) GetDimension(ratio string) repo.Dimension {
@@ -751,12 +819,12 @@ func (ctl *CreativeIslandController) ImageUpscale(ctx context.Context, webCtx we
 	quota, err := ctl.quotaRepo.GetUserQuota(ctx, user.ID)
 	if err != nil {
 		log.Errorf("get user quota failed: %s", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	quotaConsume := int64(coins.GetUnifiedImageGenCoins())
 	if quota.Quota < quota.Used+quotaConsume {
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrQuotaNotEnough), http.StatusPaymentRequired)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrQuotaNotEnough), http.StatusPaymentRequired)
 	}
 
 	upscaleBy := "x4"
@@ -773,7 +841,7 @@ func (ctl *CreativeIslandController) ImageUpscale(ctx context.Context, webCtx we
 	taskID, err := ctl.queue.Enqueue(&req, queue.NewImageUpscaleTask)
 	if err != nil {
 		log.Errorf("enqueue task failed: %s", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 	log.WithFields(log.Fields{"task_id": taskID}).Debugf("enqueue task success: %s", taskID)
 
@@ -792,7 +860,7 @@ func (ctl *CreativeIslandController) ImageUpscale(ctx context.Context, webCtx we
 	// 保存历史记录
 	if _, err := ctl.creativeRepo.CreateRecordWithArguments(ctx, user.ID, &creativeItem, &arg); err != nil {
 		log.Errorf("create creative item failed: %v", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	return webCtx.JSON(web.M{
@@ -816,12 +884,12 @@ func (ctl *CreativeIslandController) ImageColorize(ctx context.Context, webCtx w
 	quota, err := ctl.quotaRepo.GetUserQuota(ctx, user.ID)
 	if err != nil {
 		log.Errorf("get user quota failed: %s", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	quotaConsume := int64(coins.GetUnifiedImageGenCoins())
 	if quota.Quota < quota.Used+quotaConsume {
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrQuotaNotEnough), http.StatusPaymentRequired)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrQuotaNotEnough), http.StatusPaymentRequired)
 	}
 
 	req := queue.ImageColorizationPayload{
@@ -835,7 +903,7 @@ func (ctl *CreativeIslandController) ImageColorize(ctx context.Context, webCtx w
 	taskID, err := ctl.queue.Enqueue(&req, queue.NewImageColorizationTask)
 	if err != nil {
 		log.Errorf("enqueue task failed: %s", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 	log.WithFields(log.Fields{"task_id": taskID}).Debugf("enqueue task success: %s", taskID)
 
@@ -853,7 +921,7 @@ func (ctl *CreativeIslandController) ImageColorize(ctx context.Context, webCtx w
 	// 保存历史记录
 	if _, err := ctl.creativeRepo.CreateRecordWithArguments(ctx, user.ID, &creativeItem, &arg); err != nil {
 		log.Errorf("create creative item failed: %v", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	return webCtx.JSON(web.M{
@@ -863,14 +931,14 @@ func (ctl *CreativeIslandController) ImageColorize(ctx context.Context, webCtx w
 }
 
 // Completions 创作岛项目文本生成
-func (ctl *CreativeIslandController) Completions(ctx context.Context, webCtx web.Context, user *auth.User) web.Response {
-	req, errResp := ctl.resolveImageCompletionRequest(ctx, webCtx, user)
+func (ctl *CreativeIslandController) Completions(ctx context.Context, webCtx web.Context, user *auth.User, client *auth.ClientInfo) web.Response {
+	req, errResp := ctl.resolveImageCompletionRequest(ctx, webCtx, user, client)
 	if errResp != nil {
 		return errResp
 	}
 
 	// 图片地址检查
-	if req.Image != "" && !strings.HasPrefix(req.Image, "https://ssl.aicode.cc/") {
+	if req.Image != "" && !str.HasPrefixes(req.Image, []string{"https://ssl.aicode.cc/", ctl.conf.StorageDomain}) {
 		return webCtx.JSONError("invalid image", http.StatusBadRequest)
 	}
 
@@ -883,11 +951,11 @@ func (ctl *CreativeIslandController) Completions(ctx context.Context, webCtx web
 	quota, err := ctl.quotaRepo.GetUserQuota(ctx, user.ID)
 	if err != nil {
 		log.Errorf("get user quota failed: %s", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	if quota.Quota < quota.Used+req.Quota {
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrQuotaNotEnough), http.StatusPaymentRequired)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrQuotaNotEnough), http.StatusPaymentRequired)
 	}
 
 	// 内容安全检测
@@ -906,7 +974,7 @@ func (ctl *CreativeIslandController) Completions(ctx context.Context, webCtx web
 	taskID, err := ctl.queue.Enqueue(req, queue.NewImageCompletionTask)
 	if err != nil {
 		log.Errorf("enqueue task failed: %s", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 	log.WithFields(log.Fields{"task_id": taskID}).Debugf("enqueue task success: %s", taskID)
 
@@ -914,7 +982,7 @@ func (ctl *CreativeIslandController) Completions(ctx context.Context, webCtx web
 	creativeItem, arg := ctl.buildHistorySaveRecord(req, taskID)
 	if _, err := ctl.creativeRepo.CreateRecordWithArguments(ctx, user.ID, &creativeItem, &arg); err != nil {
 		log.Errorf("create creative item failed: %v", err)
-		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInternalError), http.StatusInternalServerError)
+		return webCtx.JSONError(common.Text(webCtx, ctl.trans, common.ErrInternalError), http.StatusInternalServerError)
 	}
 
 	return webCtx.JSON(web.M{

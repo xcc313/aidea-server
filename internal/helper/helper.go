@@ -3,7 +3,6 @@ package helper
 import (
 	"encoding/base64"
 	"fmt"
-	"gopkg.in/resty.v1"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,6 +10,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"gopkg.in/resty.v1"
 
 	"github.com/hashicorp/go-version"
 	"github.com/speps/go-hashids/v2"
@@ -69,8 +70,18 @@ func IsChinese(str string) bool {
 	return count/float64(utf8.RuneCountInString(str)) > 0.3
 }
 
+// WordCount 统计字符串中的字符数
 func WordCount(text string) int64 {
 	return int64(utf8.RuneCountInString(text))
+}
+
+// WordTruncate 截取字符串，如果字符串长度超过 length，则截取 length 个字符
+func WordTruncate(text string, length int64) string {
+	if WordCount(text) <= length {
+		return text
+	}
+
+	return string([]rune(text)[:length])
 }
 
 // ParseAppleDateTime 解析苹果返回的时间
@@ -182,4 +193,11 @@ func ImageToBase64Image(imagePath string) (string, error) {
 
 	mimeType := http.DetectContentType(data)
 	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+// TodayRemainTimeSeconds 获取今日剩余时间
+func TodayRemainTimeSeconds() float64 {
+	now := time.Now()
+	endOfDay := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, now.Location())
+	return endOfDay.Sub(now).Seconds()
 }

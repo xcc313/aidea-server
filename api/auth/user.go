@@ -22,11 +22,15 @@ type User struct {
 	AppleUID      string    `json:"apple_uid,omitempty"`
 	IsSetPassword bool      `json:"is_set_password,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
-	WithLab       bool      `json:"-"`
+	withLab       bool      `json:"-"`
 }
 
 func (u User) InternalUser() bool {
-	return u.UserType == repo.UserTypeInternal
+	return u.UserType == repo.UserTypeInternal || u.withLab
+}
+
+func (u User) ExtraPermissionUser() bool {
+	return u.UserType == repo.UserTypeExtraPermission
 }
 
 // UserOptional 用户信息，可选，如果用户未登录，则为 User 为 nil
@@ -52,15 +56,6 @@ func CreateAuthUserFromModel(user *model.Users) *User {
 		IsSetPassword: user.Password != "",
 		CreatedAt:     user.CreatedAt,
 		// 仅限实验室用户
-		WithLab: array.In(user.Id, []int64{
-			5,  /* 18678859721 */
-			24, /* 17347870010 */
-			10, /* 18888888888 */
-			11, /* 18883185443 */
-			12, /* 18883184444 */
-			14, /* 18746463333 */
-			15, /* 18566669988 */
-			16, /* 18564647784 */
-		}),
+		withLab: array.In(user.Id, []int64{1}),
 	}
 }
