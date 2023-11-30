@@ -6,3 +6,4 @@ Makefile.local
 .idea/
 *.log
 docker/data/**
+.DS_Store
