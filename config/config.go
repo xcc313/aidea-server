@@ -74,6 +74,12 @@ type Config struct {
 	AnthropicServer    string `json:"anthropic_server" yaml:"anthropic_server"`
 	AnthropicAPIKey    string `json:"anthropic_api_key" yaml:"anthropic_api_key"`
 
+	// Google Gemini 配置
+	EnableGoogleAI    bool   `json:"enable_googleai" yaml:"enable_googleai"`
+	GoogleAIAutoProxy bool   `json:"googleai_auto_proxy" yaml:"googleai_auto_proxy"`
+	GoogleAIServer    string `json:"googleai_server" yaml:"googleai_server"`
+	GoogleAIKey       string `json:"googleai_key" yaml:"googleai_key"`
+
 	// 百度文心大模型配置
 	EnableBaiduWXAI bool   `json:"enable_baiduwx_ai" yaml:"enable_baiduwx_ai"`
 	BaiduWXKey      string `json:"baidu_ai_key" yaml:"baidu_ai_key"`
@@ -100,6 +106,11 @@ type Config struct {
 	BaichuanAPIKey string `json:"baichuan_api_key" yaml:"baichuan_api_key"`
 	BaichuanSecret string `json:"-" yaml:"-"`
 
+	// 天工大模型
+	EnableSky    bool   `json:"enable_sky" yaml:"enable_sky"`
+	SkyAppKey    string `json:"sky_app_key" yaml:"sky_app_key"`
+	SkyAppSecret string `json:"-" yaml:"-"`
+
 	// 360 智脑
 	EnableGPT360 bool   `json:"enable_gpt360" yaml:"enable_gpt360"`
 	GPT360APIKey string `json:"gpt360_api_key" yaml:"gpt360_api_key"`
@@ -110,6 +121,14 @@ type Config struct {
 	EnableOneAPI        bool     `json:"enable_oneapi" yaml:"enable_oneapi"`
 	OneAPIServer        string   `json:"oneapi_server" yaml:"oneapi_server"`
 	OneAPIKey           string   `json:"one_api_key" yaml:"one_api_key"`
+
+	// OpenRouter 支持的模型列表
+	// open-router: https://openrouter.ai
+	OpenRouterSupportModels []string `json:"openrouter_support_models" yaml:"openrouter_support_models"`
+	EnableOpenRouter        bool     `json:"enable_openrouter" yaml:"enable_openrouter"`
+	OpenRouterAutoProxy     bool     `json:"openrouter_auto_proxy" yaml:"openrouter_auto_proxy"`
+	OpenRouterServer        string   `json:"openrouter_server" yaml:"openrouter_server"`
+	OpenRouterKey           string   `json:"openrouter_key" yaml:"openrouter_key"`
 
 	// Proxy
 	Socks5Proxy string `json:"socks5_proxy" yaml:"socks5_proxy"`
@@ -234,12 +253,30 @@ type Config struct {
 	DefaultImageToImageModel string `json:"default_image_to_image_model" yaml:"default_image_to_image_model"`
 	DefaultTextToImageModel  string `json:"default_text_to_image_model" yaml:"default_text_to_image_model"`
 
+	// 图生图图像识别处理模型，用于识别图像内容，生成图生图的提示语
+	ImageToImageRecognitionProvider string `json:"img2img-recognition-provider" yaml:"img2img-recognition-provider"`
+
 	// 虚拟模型
 	EnableVirtualModel bool         `json:"enable_virtual_model" yaml:"enable_virtual_model"`
 	VirtualModel       VirtualModel `json:"virtual_model" yaml:"virtual_model"`
 
 	// 字体文件路径
 	FontPath string `json:"font_path" yaml:"font_path"`
+	// 服务状态页面
+	ServiceStatusPage string `json:"service_status_page" yaml:"service_status_page"`
+
+	// 免费 Chat 请求 （仅限 IOS）
+	FreeChatEnabled bool `json:"free_chat_enabled" yaml:"free_chat_enabled"`
+	// 免费 Chat 每日限制(每 IP)
+	FreeChatDailyLimit int `json:"free_chat_daily_limit" yaml:"free_chat_daily_limit"`
+	// 免费 Chat 每日全局限制（不区分 IP）
+	FreeChatDailyGlobalLimit int `json:"free_chat_daily_global_limit" yaml:"free_chat_daily_global_limit"`
+	// 免费 Chat 模型
+	FreeChatModel string `json:"free_chat_model" yaml:"free_chat_model"`
+
+	// 微信开放平台配置
+	WeChatAppID  string `json:"wechat_appid" yaml:"wechat_appid"`
+	WeChatSecret string `json:"wechat_secret" yaml:"wechat_secret"`
 }
 
 func (conf *Config) SupportProxy() bool {
@@ -354,6 +391,11 @@ func Register(ins *app.App) {
 			AnthropicServer:    ctx.String("anthropic-server"),
 			AnthropicAPIKey:    ctx.String("anthropic-apikey"),
 
+			EnableGoogleAI:    ctx.Bool("enable-googleai"),
+			GoogleAIAutoProxy: ctx.Bool("googleai-autoproxy"),
+			GoogleAIServer:    ctx.String("googleai-server"),
+			GoogleAIKey:       ctx.String("googleai-key"),
+
 			EnableBaiduWXAI: ctx.Bool("enable-baiduwxai"),
 			BaiduWXKey:      ctx.String("baiduwx-key"),
 			BaiduWXSecret:   ctx.String("baiduwx-secret"),
@@ -375,6 +417,10 @@ func Register(ins *app.App) {
 			BaichuanAPIKey: ctx.String("baichuan-apikey"),
 			BaichuanSecret: ctx.String("baichuan-secret"),
 
+			EnableSky:    ctx.Bool("enable-sky"),
+			SkyAppKey:    ctx.String("sky-appkey"),
+			SkyAppSecret: ctx.String("sky-appsecret"),
+
 			EnableGPT360: ctx.Bool("enable-gpt360"),
 			GPT360APIKey: ctx.String("gpt360-apikey"),
 
@@ -382,6 +428,12 @@ func Register(ins *app.App) {
 			EnableOneAPI:        ctx.Bool("enable-oneapi"),
 			OneAPIServer:        ctx.String("oneapi-server"),
 			OneAPIKey:           ctx.String("oneapi-key"),
+
+			OpenRouterSupportModels: ctx.StringSlice("openrouter-support-models"),
+			EnableOpenRouter:        ctx.Bool("enable-openrouter"),
+			OpenRouterAutoProxy:     ctx.Bool("openrouter-autoproxy"),
+			OpenRouterServer:        ctx.String("openrouter-server"),
+			OpenRouterKey:           ctx.String("openrouter-key"),
 
 			Socks5Proxy: ctx.String("socks5-proxy"),
 			ProxyURL:    ctx.String("proxy-url"),
@@ -484,6 +536,8 @@ func Register(ins *app.App) {
 			DefaultImageToImageModel: ctx.String("default-img2img-model"),
 			DefaultTextToImageModel:  ctx.String("default-txt2img-model"),
 
+			ImageToImageRecognitionProvider: ctx.String("img2img-recognition-provider"),
+
 			EnableVirtualModel: ctx.Bool("enable-virtual-model"),
 			VirtualModel: VirtualModel{
 				Implementation: ctx.String("virtual-model-implementation"),
@@ -493,7 +547,16 @@ func Register(ins *app.App) {
 				BeichouPrompt:  strings.TrimSpace(ctx.String("virtual-model-beichou-prompt")),
 			},
 
-			FontPath: ctx.String("font-path"),
+			FontPath:          ctx.String("font-path"),
+			ServiceStatusPage: ctx.String("service-status-page"),
+
+			FreeChatEnabled:          ctx.Bool("free-chat-enabled"),
+			FreeChatDailyLimit:       ctx.Int("free-chat-daily-limit"),
+			FreeChatDailyGlobalLimit: ctx.Int("free-chat-daily-global-limit"),
+			FreeChatModel:            ctx.String("free-chat-model"),
+
+			WeChatAppID:  ctx.String("wechat-appid"),
+			WeChatSecret: ctx.String("wechat-secret"),
 		}
 	})
 }

@@ -5,16 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	chat2 "github.com/mylxsw/aidea-server/pkg/ai/chat"
+	"github.com/mylxsw/aidea-server/pkg/ai/chat"
 	"github.com/mylxsw/aidea-server/pkg/ai/control"
 	openaiHelper "github.com/mylxsw/aidea-server/pkg/ai/openai"
 	"github.com/mylxsw/aidea-server/pkg/ai/streamwriter"
 	"github.com/mylxsw/aidea-server/pkg/misc"
 	"github.com/mylxsw/aidea-server/pkg/rate"
-	repo2 "github.com/mylxsw/aidea-server/pkg/repo"
-	service2 "github.com/mylxsw/aidea-server/pkg/service"
+	"github.com/mylxsw/aidea-server/pkg/repo"
+	"github.com/mylxsw/aidea-server/pkg/service"
 	"github.com/mylxsw/aidea-server/pkg/tencent"
 	"github.com/mylxsw/aidea-server/pkg/youdao"
+	"github.com/mylxsw/go-utils/array"
 	"net/http"
 	"os"
 	"strconv"
@@ -38,15 +39,16 @@ import (
 // OpenAIController OpenAI 控制器
 type OpenAIController struct {
 	conf        *config.Config
-	chat        chat2.Chat                `autowire:"@"`
-	client      openaiHelper.Client       `autowire:"@"`
-	translater  youdao.Translater         `autowire:"@"`
-	tencent     *tencent.Tencent          `autowire:"@"`
-	messageRepo *repo2.MessageRepo        `autowire:"@"`
-	securitySrv *service2.SecurityService `autowire:"@"`
-	userSrv     *service2.UserService     `autowire:"@"`
-	chatSrv     *service2.ChatService     `autowire:"@"`
-	limiter     *rate.RateLimiter         `autowire:"@"`
+	chat        chat.Chat                `autowire:"@"`
+	client      openaiHelper.Client      `autowire:"@"`
+	translater  youdao.Translater        `autowire:"@"`
+	tencent     *tencent.Tencent         `autowire:"@"`
+	messageRepo *repo.MessageRepo        `autowire:"@"`
+	securitySrv *service.SecurityService `autowire:"@"`
+	userSrv     *service.UserService     `autowire:"@"`
+	chatSrv     *service.ChatService     `autowire:"@"`
+	limiter     *rate.RateLimiter        `autowire:"@"`
+	repo        *repo.Repository         `autowire:"@"`
 
 	upgrader websocket.Upgrader
 
@@ -86,7 +88,7 @@ func (ctl *OpenAIController) Register(router web.Router) {
 
 // audioTranscriptions 语音转文本
 // https://platform.openai.com/docs/api-reference/audio/createTranscription
-func (ctl *OpenAIController) audioTranscriptions(ctx context.Context, webCtx web.Context, user *auth.User, quotaRepo *repo2.QuotaRepo) web.Response {
+func (ctl *OpenAIController) audioTranscriptions(ctx context.Context, webCtx web.Context, user *auth.User, quotaRepo *repo.QuotaRepo) web.Response {
 	// TODO 增加客户端控制语音转文本的参数：model/file/language/prompt/response_format/temperature
 	model := ternary.If(ctl.conf.UseTencentVoiceToText, "tencent", "whisper-1")
 
@@ -170,7 +172,7 @@ func (ctl *OpenAIController) audioTranscriptions(ctx context.Context, webCtx web
 	}
 
 	defer func() {
-		if err := quotaRepo.QuotaConsume(ctx, user.ID, coins.GetVoiceCoins(model), repo2.NewQuotaUsedMeta("openai-voice", model)); err != nil {
+		if err := quotaRepo.QuotaConsume(ctx, user.ID, coins.GetVoiceCoins(model), repo.NewQuotaUsedMeta("openai-voice", model)); err != nil {
 			log.Errorf("used quota add failed: %s", err)
 		}
 	}()
@@ -195,15 +197,45 @@ func (m FinalMessage) ToJSON() string {
 
 // Chat 聊天接口，接口参数参考 https://platform.openai.com/docs/api-reference/chat/create
 // 该接口会返回一个 SSE 流，接口参数 stream 总是为 true（忽略客户端设置）
-func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user *auth.User, quotaRepo *repo2.QuotaRepo, w http.ResponseWriter, client *auth.ClientInfo) {
-	sw, req, err := streamwriter.New[chat2.Request](
+func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user *auth.UserOptional, quotaRepo *repo.QuotaRepo, w http.ResponseWriter, client *auth.ClientInfo) {
+	if user.User == nil && ctl.conf.FreeChatEnabled && client.IsIOS() {
+		// 匿名用户访问
+		user.User = &auth.User{
+			ID:   0,
+			Name: "anonymous",
+		}
+	}
+
+	if user.User == nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error": "用户未登录，请先登录后再试"}`))
+		return
+	}
+
+	// 流控，避免单一用户过度使用
+	if err := ctl.rateLimitPass(ctx, client, user.User); err != nil {
+		if errors.Is(err, rate.ErrDailyFreeLimitExceeded) {
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"error": %s}`, strconv.Quote(err.Error()))))
+		return
+	}
+
+	sw, req, err := streamwriter.New[chat.Request](
 		webCtx.Input("ws") == "true", ctl.conf.EnableCORS, webCtx.Request().Raw(), w,
 	)
 	if err != nil {
-		log.F(log.M{"user": user.ID, "client": client}).Errorf("create stream writer failed: %s", err)
+		log.F(log.M{"user": user.User.ID, "client": client}).Errorf("create stream writer failed: %s", err)
 		return
 	}
 	defer sw.Close()
+
+	// 匿名用户，使用免费模型代替
+	if user.User.ID == 0 && ctl.conf.FreeChatModel != "" {
+		req.Model = ctl.conf.FreeChatModel
+	}
 
 	// 请求参数预处理
 	var inputTokenCount, maxContextLen int64
@@ -211,7 +243,7 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 	if ctl.apiMode {
 		// API 模式下，还原 n 参数原始值（不支持 room 上下文配置）
 		req.N = int(req.RoomID)
-		icnt, err := chat2.MessageTokenCount(req.Messages, req.Model)
+		icnt, err := chat.MessageTokenCount(req.Messages, req.Model)
 		if err != nil {
 			misc.NoError(sw.WriteErrorStream(err, http.StatusBadRequest))
 			return
@@ -219,8 +251,28 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 
 		inputTokenCount = int64(icnt)
 	} else {
-		maxContextLen = ctl.loadRoomContextLen(ctx, req.RoomID, user.ID)
-		req, inputTokenCount, err = req.Fix(ctl.chat, maxContextLen)
+		// 支持 V2 版本的 homeModel 请求
+		// model 格式为 v2@{type}|{id}
+		if strings.HasPrefix(req.Model, "v2@") {
+			models := array.ToMap(chat.Models(ctl.conf, true), func(item chat.Model, _ int) string {
+				return item.ID
+			})
+			homeModel, err := ctl.userSrv.QueryHomeModel(ctx, models, user.User.ID, strings.TrimPrefix(req.Model, "v2@"))
+			if err != nil {
+				misc.NoError(sw.WriteErrorStream(err, http.StatusBadRequest))
+				return
+			}
+
+			req.Model = homeModel.ModelID
+			if strings.TrimSpace(homeModel.Prompt) != "" {
+				contextMessages := array.Filter(req.Messages, func(item chat.Message, _ int) bool { return item.Role != "system" })
+				req.Messages = append(chat.Messages{{Role: "system", Content: homeModel.Prompt}}, contextMessages...)
+			}
+		}
+
+		// 模型最大上下文长度限制
+		maxContextLen = ctl.loadRoomContextLen(ctx, req.RoomID, user.User.ID)
+		req, inputTokenCount, err = req.Fix(ctl.chat, maxContextLen, ternary.If(user.User.ID > 0, 1000*200, 1000))
 		if err != nil {
 			misc.NoError(sw.WriteErrorStream(err, http.StatusBadRequest))
 			return
@@ -234,16 +286,18 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 		return
 	}
 
-	// 基于模型的流控，避免单一模型用户过度使用
-	if err := ctl.rateLimitPass(ctx, user, req, sw); err != nil {
-		return
-	}
-
 	// 免费模型
 	// 获取当前用户剩余的智慧果数量，如果不足，则返回错误
-	leftCount, maxFreeCount := ctl.userSrv.FreeChatRequestCounts(ctx, user.ID, req.Model)
+	var leftCount, maxFreeCount int
+	if user.User.ID > 0 {
+		leftCount, maxFreeCount = ctl.userSrv.FreeChatRequestCounts(ctx, user.User.ID, req.Model)
+	} else {
+		// 匿名用户，每次都是免费的，不限制次数，通过流控来限制访问
+		leftCount, maxFreeCount = 1, 0
+	}
+
 	if leftCount <= 0 {
-		quota, needCoins, err := ctl.queryChatQuota(ctx, quotaRepo, user, sw, webCtx, req, inputTokenCount, maxFreeCount)
+		quota, needCoins, err := ctl.queryChatQuota(ctx, quotaRepo, user.User, sw, webCtx, req, inputTokenCount, maxFreeCount)
 		if err != nil {
 			return
 		}
@@ -260,20 +314,20 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 		}
 
 		// 冻结本次所需要的智慧果
-		if err := ctl.userSrv.FreezeUserQuota(ctx, user.ID, needCoins); err != nil {
-			log.F(log.M{"user_id": user.ID, "quota": needCoins}).Errorf("freeze user quota failed: %s", err)
+		if err := ctl.userSrv.FreezeUserQuota(ctx, user.User.ID, needCoins); err != nil {
+			log.F(log.M{"user_id": user.User.ID, "quota": needCoins}).Errorf("freeze user quota failed: %s", err)
 		} else {
 			defer func(ctx context.Context) {
 				// 解冻智慧果
-				if err := ctl.userSrv.UnfreezeUserQuota(ctx, user.ID, needCoins); err != nil {
-					log.F(log.M{"user_id": user.ID, "quota": needCoins}).Errorf("unfreeze user quota failed: %s", err)
+				if err := ctl.userSrv.UnfreezeUserQuota(ctx, user.User.ID, needCoins); err != nil {
+					log.F(log.M{"user_id": user.User.ID, "quota": needCoins}).Errorf("unfreeze user quota failed: %s", err)
 				}
 			}(ctx)
 		}
 	}
 
 	// 内容安全检测
-	if err := ctl.contentSafety(req, user, sw); err != nil {
+	if err := ctl.contentSafety(req, user.User, sw); err != nil {
 		return
 	}
 
@@ -283,7 +337,7 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 	startTime := time.Now()
 	defer func() {
 		log.F(log.M{
-			"user_id": user.ID,
+			"user_id": user.User.ID,
 			"client":  client,
 			"room_id": req.RoomID,
 			"elapse":  time.Since(startTime).Seconds(),
@@ -298,10 +352,10 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 	}()
 
 	// 写入用户消息
-	questionID := ctl.saveChatQuestion(ctx, user, req)
+	questionID := ctl.saveChatQuestion(ctx, user.User, req)
 
 	// 发起聊天请求并返回 SSE/WS 流
-	replyText, err := ctl.handleChat(ctx, req, user, sw, webCtx, questionID, 0)
+	replyText, err := ctl.handleChat(ctx, req, user.User, sw, webCtx, questionID, 0)
 	if errors.Is(err, ErrChatResponseHasSent) {
 		return
 	}
@@ -312,9 +366,9 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 	if errors.Is(err, ErrChatResponseEmpty) || (errors.Is(err, ErrChatResponseGapTimeout) && replyText == "") {
 		// 如果用户等待时间超过 60s，则不再重试，避免用户等待时间过长
 		if startTime.Add(60 * time.Second).After(time.Now()) {
-			log.F(log.M{"req": req, "user_id": user.ID}).Warningf("聊天响应为空，尝试再次请求，模型：%s", req.Model)
+			log.F(log.M{"req": req, "user_id": user.User.ID}).Warningf("聊天响应为空，尝试再次请求，模型：%s", req.Model)
 
-			replyText, err = ctl.handleChat(ctx, req, user, sw, webCtx, questionID, 1)
+			replyText, err = ctl.handleChat(ctx, req, user.User, sw, webCtx, questionID, 1)
 			if errors.Is(err, ErrChatResponseHasSent) {
 				return
 			}
@@ -323,7 +377,7 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 
 	chatErrorMessage := ternary.IfLazy(err == nil, func() string { return "" }, func() string { return err.Error() })
 	if chatErrorMessage != "" {
-		log.F(log.M{"req": req, "user_id": user.ID, "reply": replyText, "elapse": time.Since(startTime).Seconds()}).
+		log.F(log.M{"req": req, "user_id": user.User.ID, "reply": replyText, "elapse": time.Since(startTime).Seconds()}).
 			Errorf("聊天失败，模型：%s，错误：%s", req.Model, chatErrorMessage)
 	}
 
@@ -335,14 +389,14 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 		defer cancel()
 
 		// 写入用户消息
-		answerID := ctl.saveChatAnswer(ctx, user, replyText, quotaConsumed, realTokenConsumed, req, questionID, chatErrorMessage)
+		answerID := ctl.saveChatAnswer(ctx, user.User, replyText, quotaConsumed, realTokenConsumed, req, questionID, chatErrorMessage)
 
 		if errors.Is(ErrChatResponseEmpty, err) {
 			misc.NoError(sw.WriteErrorStream(err, http.StatusInternalServerError))
 		} else {
 			if !ctl.apiMode {
 				// final 消息为定制消息，用于告诉 AIdea 客户端当前的资源消耗情况以及服务端信息
-				finalWord := ctl.buildFinalSystemMessage(questionID, answerID, user, quotaConsumed, realTokenConsumed, req, maxContextLen, chatErrorMessage)
+				finalWord := ctl.buildFinalSystemMessage(questionID, answerID, user.User, quotaConsumed, realTokenConsumed, req, maxContextLen, chatErrorMessage)
 				misc.NoError(sw.WriteStream(finalWord))
 			}
 		}
@@ -354,9 +408,9 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 
-			if err := ctl.userSrv.UpdateFreeChatCount(ctx, user.ID, req.Model); err != nil {
+			if err := ctl.userSrv.UpdateFreeChatCount(ctx, user.User.ID, req.Model); err != nil {
 				log.WithFields(log.Fields{
-					"user_id": user.ID,
+					"user_id": user.User.ID,
 					"model":   req.Model,
 				}).Errorf("update free chat count failed: %s", err)
 			}
@@ -369,7 +423,7 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 
-			if err := quotaRepo.QuotaConsume(ctx, user.ID, quotaConsumed, repo2.NewQuotaUsedMeta("chat", req.Model)); err != nil {
+			if err := quotaRepo.QuotaConsume(ctx, user.User.ID, quotaConsumed, repo.NewQuotaUsedMeta("chat", req.Model)); err != nil {
 				log.Errorf("used quota add failed: %s", err)
 			}
 		}()
@@ -378,7 +432,7 @@ func (ctl *OpenAIController) Chat(ctx context.Context, webCtx web.Context, user 
 
 func (ctl *OpenAIController) handleChat(
 	ctx context.Context,
-	req *chat2.Request,
+	req *chat.Request,
 	user *auth.User,
 	sw *streamwriter.StreamWriter,
 	webCtx web.Context,
@@ -399,12 +453,12 @@ func (ctl *OpenAIController) handleChat(
 		ctl.makeChatQuestionFailed(ctx, questionID, err)
 
 		// 内容违反内容安全策略
-		if errors.Is(err, chat2.ErrContentFilter) {
+		if errors.Is(err, chat.ErrContentFilter) {
 			ctl.sendViolateContentPolicyResp(sw, "")
 			return "", ErrChatResponseHasSent
 		}
 
-		log.WithFields(log.Fields{"req": req, "user_id": user.ID, "retry_times": retryTimes}).Errorf("聊天请求失败，模型 %s: %v", req.Model, err)
+		log.WithFields(log.Fields{"user_id": user.ID, "retry_times": retryTimes}).Errorf("聊天请求失败，模型 %s: %v", req.Model, err)
 
 		misc.NoError(sw.WriteErrorStream(errors.New(common.Text(webCtx, ctl.translater, common.ErrInternalError)), http.StatusInternalServerError))
 		return "", ErrChatResponseHasSent
@@ -430,7 +484,7 @@ var (
 	ErrChatResponseGapTimeout = errors.New("两次响应之间等待时间过长，强制中断")
 )
 
-func (ctl *OpenAIController) writeChatResponse(ctx context.Context, req *chat2.Request, stream <-chan chat2.Response, user *auth.User, sw *streamwriter.StreamWriter) (string, error) {
+func (ctl *OpenAIController) writeChatResponse(ctx context.Context, req *chat.Request, stream <-chan chat.Response, user *auth.User, sw *streamwriter.StreamWriter) (string, error) {
 	var replyText string
 
 	// 生成 SSE 流
@@ -517,7 +571,7 @@ func (*OpenAIController) buildFinalSystemMessage(
 	user *auth.User,
 	quotaConsumed int64,
 	realTokenConsumed int,
-	req *chat2.Request,
+	req *chat.Request,
 	maxContextLen int64,
 	chatErrorMessage string,
 ) ChatCompletionStreamResponse {
@@ -529,7 +583,7 @@ func (*OpenAIController) buildFinalSystemMessage(
 		Error:      chatErrorMessage,
 	}
 
-	if len(req.Messages) >= int(maxContextLen*2) {
+	if len(req.Messages) >= int(maxContextLen*2)-1 {
 		if req.RoomID <= 1 {
 			finalMsg.Info = fmt.Sprintf("本次请求消耗了 %d 个 Token。\n\nAI 记住的对话信息越多，消耗的 Token 和智慧果也越多。\n\n如果新问题和之前的对话无关，请在“聊一聊”页面创建新对话。", realTokenConsumed)
 		} else {
@@ -561,14 +615,14 @@ func (*OpenAIController) buildFinalSystemMessage(
 // queryChatQuota 检查用户智慧果余量是否足够
 func (ctl *OpenAIController) queryChatQuota(
 	ctx context.Context,
-	quotaRepo *repo2.QuotaRepo,
+	quotaRepo *repo.QuotaRepo,
 	user *auth.User,
 	sw *streamwriter.StreamWriter,
 	webCtx web.Context,
-	req *chat2.Request,
+	req *chat.Request,
 	inputTokenCount int64,
 	maxFreeCount int,
-) (quota *service2.UserQuota, needCoins int64, err error) {
+) (quota *service.UserQuota, needCoins int64, err error) {
 	quota, err = ctl.userSrv.UserQuota(ctx, user.ID)
 	if err != nil {
 		log.F(log.M{"user_id": user.ID}).Errorf("查询用户智慧果余量失败: %s", err)
@@ -581,33 +635,55 @@ func (ctl *OpenAIController) queryChatQuota(
 	return quota, coins.GetOpenAITextCoins(req.ResolveCalFeeModel(ctl.conf), inputTokenCount) + 3, nil
 }
 
-func (ctl *OpenAIController) rateLimitPass(ctx context.Context, user *auth.User, req *chat2.Request, sw *streamwriter.StreamWriter) error {
+func (ctl *OpenAIController) rateLimitPass(ctx context.Context, client *auth.ClientInfo, user *auth.User) error {
 	if ctl.conf.EnableModelRateLimit {
-		if err := ctl.limiter.Allow(ctx, fmt.Sprintf("chat-limit:u:%d:m:%s:minute", user.ID, req.Model), redis_rate.PerMinute(5)); err != nil {
+		if err := ctl.limiter.Allow(ctx, fmt.Sprintf("chat-limit:u:%d:minute", user.ID), redis_rate.PerMinute(10)); err != nil {
 			if errors.Is(err, rate.ErrRateLimitExceeded) {
-				misc.NoError(sw.WriteErrorStream(errors.New("操作频率过高，请稍后再试"), http.StatusBadRequest))
 				return rate.ErrRateLimitExceeded
 			}
 
-			log.F(log.M{"user_id": user.ID, "req": req}).Errorf("check rate limit failed: %s", err)
+			log.F(log.M{"user_id": user.ID}).Errorf("聊天请求频率过高： %s", err)
 		}
+	}
+
+	// 匿名用户每日免费次数限制
+	if ctl.conf.FreeChatEnabled && user.ID == 0 {
+		lim := redis_rate.Limit{Rate: ctl.conf.FreeChatDailyLimit, Burst: ctl.conf.FreeChatDailyLimit, Period: time.Hour * 24}
+		if err := ctl.limiter.Allow(ctx, fmt.Sprintf("chat-limit:anonymous:%s:daily", client.IP), lim); err != nil {
+			log.F(log.M{"ip": client.IP}).Errorf("今日免费次数已用完（IP）: %s", err)
+			return rate.ErrDailyFreeLimitExceeded
+		}
+
+		// 全局限制免费次数，这里是总次数，不区分用户
+		if ctl.conf.FreeChatDailyGlobalLimit > 0 {
+			dailyGlobalLimitKey := fmt.Sprintf("chat-limit:free:daily:%s", time.Now().Format("2006-01-02"))
+			todayCount, _ := ctl.limiter.OperationCount(ctx, dailyGlobalLimitKey)
+			if todayCount > int64(ctl.conf.FreeChatDailyGlobalLimit) {
+				log.F(log.M{"ip": client.IP}).Errorf("今日免费次数已用完（全局）")
+				return rate.ErrDailyFreeLimitExceeded
+			}
+
+			_ = ctl.limiter.OperationIncr(ctx, dailyGlobalLimitKey, time.Hour*24)
+		}
+
+		log.F(log.M{"ip": client.IP}).Debugf("free request")
 	}
 
 	return nil
 }
 
-func (ctl *OpenAIController) saveChatAnswer(ctx context.Context, user *auth.User, replyText string, quotaConsumed int64, realWordCount int, req *chat2.Request, questionID int64, chatErrorMessage string) int64 {
+func (ctl *OpenAIController) saveChatAnswer(ctx context.Context, user *auth.User, replyText string, quotaConsumed int64, realWordCount int, req *chat.Request, questionID int64, chatErrorMessage string) int64 {
 	if ctl.conf.EnableRecordChat && !ctl.apiMode {
-		answerID, err := ctl.messageRepo.Add(ctx, repo2.MessageAddReq{
+		answerID, err := ctl.messageRepo.Add(ctx, repo.MessageAddReq{
 			UserID:        user.ID,
 			Message:       replyText,
-			Role:          repo2.MessageRoleAssistant,
+			Role:          repo.MessageRoleAssistant,
 			QuotaConsumed: quotaConsumed,
 			TokenConsumed: int64(realWordCount),
 			RoomID:        req.RoomID,
 			Model:         req.Model,
 			PID:           questionID,
-			Status:        int64(ternary.If(chatErrorMessage != "", repo2.MessageStatusFailed, repo2.MessageStatusSucceed)),
+			Status:        int64(ternary.If(chatErrorMessage != "", repo.MessageStatusFailed, repo.MessageStatusSucceed)),
 			Error:         chatErrorMessage,
 		})
 		if err != nil {
@@ -619,13 +695,13 @@ func (ctl *OpenAIController) saveChatAnswer(ctx context.Context, user *auth.User
 	return 0
 }
 
-func (ctl *OpenAIController) resolveConsumeQuota(req *chat2.Request, replyText string, isFreeRequest bool) (int, int64) {
-	messages := append(req.Messages, chat2.Message{
+func (ctl *OpenAIController) resolveConsumeQuota(req *chat.Request, replyText string, isFreeRequest bool) (int, int64) {
+	messages := append(req.Messages, chat.Message{
 		Role:    "assistant",
 		Content: replyText,
 	})
 
-	realTokenConsumed, _ := chat2.MessageTokenCount(messages, req.Model)
+	realTokenConsumed, _ := chat.MessageTokenCount(messages, req.Model)
 	quotaConsumed := coins.GetOpenAITextCoins(req.ResolveCalFeeModel(ctl.conf), int64(realTokenConsumed))
 
 	// 免费请求，不扣除智慧果
@@ -639,8 +715,8 @@ func (ctl *OpenAIController) resolveConsumeQuota(req *chat2.Request, replyText s
 // makeChatQuestionFailed 更新聊天问题为失败状态
 func (ctl *OpenAIController) makeChatQuestionFailed(ctx context.Context, questionID int64, err error) {
 	if questionID > 0 {
-		if err := ctl.messageRepo.UpdateMessageStatus(ctx, questionID, repo2.MessageUpdateReq{
-			Status: repo2.MessageStatusFailed,
+		if err := ctl.messageRepo.UpdateMessageStatus(ctx, questionID, repo.MessageUpdateReq{
+			Status: repo.MessageStatusFailed,
 			Error:  err.Error(),
 		}); err != nil {
 			log.WithFields(log.Fields{
@@ -652,15 +728,15 @@ func (ctl *OpenAIController) makeChatQuestionFailed(ctx context.Context, questio
 }
 
 // saveChatQuestion 保存用户聊天问题
-func (ctl *OpenAIController) saveChatQuestion(ctx context.Context, user *auth.User, req *chat2.Request) int64 {
+func (ctl *OpenAIController) saveChatQuestion(ctx context.Context, user *auth.User, req *chat.Request) int64 {
 	if ctl.conf.EnableRecordChat && !ctl.apiMode {
-		qid, err := ctl.messageRepo.Add(ctx, repo2.MessageAddReq{
+		qid, err := ctl.messageRepo.Add(ctx, repo.MessageAddReq{
 			UserID:  user.ID,
 			Message: req.Messages[len(req.Messages)-1].Content,
-			Role:    repo2.MessageRoleUser,
+			Role:    repo.MessageRoleUser,
 			RoomID:  req.RoomID,
 			Model:   req.Model,
-			Status:  repo2.MessageStatusSucceed,
+			Status:  repo.MessageStatusSucceed,
 		})
 		if err != nil {
 			log.F(log.M{"req": req, "user_id": user.ID}).Errorf("保存用户聊天请求失败（问题部分）: %s", err)
@@ -674,7 +750,7 @@ func (ctl *OpenAIController) saveChatQuestion(ctx context.Context, user *auth.Us
 
 func (ctl *OpenAIController) loadRoomContextLen(ctx context.Context, roomID int64, userID int64) int64 {
 	var maxContextLength int64 = 3
-	if roomID > 0 {
+	if roomID > 0 && userID > 0 {
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 
@@ -692,7 +768,7 @@ func (ctl *OpenAIController) loadRoomContextLen(ctx context.Context, roomID int6
 }
 
 // 内容安全检测
-func (ctl *OpenAIController) contentSafety(req *chat2.Request, user *auth.User, sw *streamwriter.StreamWriter) error {
+func (ctl *OpenAIController) contentSafety(req *chat.Request, user *auth.User, sw *streamwriter.StreamWriter) error {
 	// API 模式下，不进行内容安全检测
 	if ctl.apiMode {
 		return nil
@@ -730,7 +806,7 @@ func (ctl *OpenAIController) sendViolateContentPolicyResp(sw *streamwriter.Strea
 }
 
 // Images 图像生成接口，接口参数参考 https://platform.openai.com/docs/api-reference/images/create
-func (ctl *OpenAIController) Images(ctx context.Context, webCtx web.Context, user *auth.User, quotaRepo *repo2.QuotaRepo) web.Response {
+func (ctl *OpenAIController) Images(ctx context.Context, webCtx web.Context, user *auth.User, quotaRepo *repo.QuotaRepo) web.Response {
 	var req openai.ImageRequest
 	if err := webCtx.Unmarshal(&req); err != nil {
 		return webCtx.JSONError(common.Text(webCtx, ctl.translater, common.ErrInvalidRequest), http.StatusBadRequest)
@@ -794,7 +870,7 @@ func (ctl *OpenAIController) Images(ctx context.Context, webCtx web.Context, use
 	}
 
 	defer func() {
-		if err := quotaRepo.QuotaConsume(ctx, user.ID, int64(coins.GetUnifiedImageGenCoins(model)*req.N), repo2.NewQuotaUsedMeta("openai-image", model)); err != nil {
+		if err := quotaRepo.QuotaConsume(ctx, user.ID, int64(coins.GetUnifiedImageGenCoins(model)*req.N), repo.NewQuotaUsedMeta("openai-image", model)); err != nil {
 			log.Errorf("used quota add failed: %s", err)
 		}
 	}()

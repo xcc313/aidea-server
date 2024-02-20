@@ -36,19 +36,19 @@ func TestRequestFix(t *testing.T) {
 	}.Init()
 
 	{
-		fixed, _, err := req.Fix(ChatTestClient{}, 0)
+		fixed, _, err := req.Fix(ChatTestClient{}, 0, 1024*200)
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(fixed.Messages))
 	}
 
 	{
-		fixed, _, err := req.Fix(ChatTestClient{}, 1)
+		fixed, _, err := req.Fix(ChatTestClient{}, 1, 1024*200)
 		assert.NoError(t, err)
 		assert.Equal(t, 4, len(fixed.Messages))
 	}
 
 	{
-		fixed, _, err := req.Fix(ChatTestClient{}, 2)
+		fixed, _, err := req.Fix(ChatTestClient{}, 2, 1024*200)
 		assert.NoError(t, err)
 		assert.Equal(t, 6, len(fixed.Messages))
 	}
@@ -69,7 +69,7 @@ func TestMessages_Fix(t *testing.T) {
 }
 
 func TestDashscopeChat_InitRequest(t *testing.T) {
-	client := NewDashScopeChat(nil)
+	client := NewDashScopeChat(nil, nil)
 	{
 		messages := Messages{
 			{Role: "system", Content: "假如你是鲁迅，请使用批判性，略带讽刺的语言来回答我的问题，语言要风趣，幽默，略带调侃"},

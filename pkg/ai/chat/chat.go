@@ -8,8 +8,11 @@ import (
 	"github.com/mylxsw/aidea-server/pkg/ai/baichuan"
 	"github.com/mylxsw/aidea-server/pkg/ai/baidu"
 	"github.com/mylxsw/aidea-server/pkg/ai/dashscope"
+	"github.com/mylxsw/aidea-server/pkg/ai/google"
 	"github.com/mylxsw/aidea-server/pkg/ai/gpt360"
+	"github.com/mylxsw/aidea-server/pkg/ai/openrouter"
 	"github.com/mylxsw/aidea-server/pkg/ai/sensenova"
+	"github.com/mylxsw/aidea-server/pkg/ai/sky"
 	"github.com/mylxsw/aidea-server/pkg/ai/tencentai"
 	"github.com/mylxsw/aidea-server/pkg/ai/xfyun"
 	"strings"
@@ -54,6 +57,18 @@ type ImageURL struct {
 }
 
 type Messages []Message
+
+func (ms Messages) HasImage() bool {
+	for _, msg := range ms {
+		for _, part := range msg.MultipartContents {
+			if part.ImageURL != nil && part.ImageURL.URL != "" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
 
 func (ms Messages) Fix() Messages {
 	msgs := ms
@@ -133,14 +148,29 @@ func (req Request) Init() Request {
 
 	// 过滤掉内容为空的 message
 	req.Messages = array.Filter(req.Messages, func(item Message, _ int) bool { return strings.TrimSpace(item.Content) != "" })
+
+	// TODO 临时方案，对于 Google Gemini Pro Vision 模型，有以下特性:
+	// 1. 不支持多轮对话
+	// 2. 请求中必须包含图片
+	if req.Model == google.ModelGeminiProVision && len(req.Messages) > 1 {
+		// 只保留最后一条消息
+		req.Messages = req.Messages[len(req.Messages)-1:]
+	}
+
 	return req
 }
 
 // Fix 修复请求内容，注意：上下文长度修复后，最终的上下文数量不包含 system 消息和用户最后一条消息
-func (req Request) Fix(chat Chat, maxContextLength int64) (*Request, int64, error) {
+func (req Request) Fix(chat Chat, maxContextLength int64, maxTokenCount int) (*Request, int64, error) {
 	// 自动缩减上下文长度至满足模型要求的最大长度，尽可能避免出现超过模型上下文长度的问题
 	systemMessages := array.Filter(req.Messages, func(item Message, _ int) bool { return item.Role == "system" })
 	systemMessageLen, _ := MessageTokenCount(systemMessages, req.Model)
+
+	// 模型允许的 Tokens 数量和请求参数指定的 Tokens 数量，取最小值
+	modelTokenLimit := chat.MaxContextLength(req.Model) - systemMessageLen
+	if modelTokenLimit < maxTokenCount {
+		maxTokenCount = modelTokenLimit
+	}
 
 	messages, inputTokens, err := ReduceMessageContext(
 		ReduceMessageContextUpToContextWindow(
@@ -148,7 +178,7 @@ func (req Request) Fix(chat Chat, maxContextLength int64) (*Request, int64, erro
 			int(maxContextLength),
 		),
 		req.Model,
-		chat.MaxContextLength(req.Model)-systemMessageLen,
+		maxTokenCount,
 	)
 	if err != nil {
 		return nil, 0, errors.New("超过模型最大允许的上下文长度限制，请尝试“新对话”或缩短输入内容长度")
@@ -166,9 +196,6 @@ func (req Request) Fix(chat Chat, maxContextLength int64) (*Request, int64, erro
 		}
 		return item
 	})
-
-	// TODO 这里是临时解决方案
-	req.MaxTokens = 4000
 
 	return &req, int64(inputTokens), nil
 }
@@ -204,100 +231,79 @@ type Chat interface {
 }
 
 type Imp struct {
-	openAI      *OpenAIChat
-	baiduAI     *BaiduAIChat
-	dashScope   *DashScopeChat
-	xfyunAI     *XFYunChat
-	snAI        *SenseNovaChat
-	tencentAI   *TencentAIChat
-	anthropicAI *AnthropicChat
-	baichuanAI  *BaichuanAIChat
-	g360        *GPT360Chat
-	virtual     *VirtualChat
-	one         *OneAPIChat
+	ai      *AI
+	virtual *VirtualChat
 }
 
-func NewChat(
-	conf *config.Config,
-	openAI *OpenAIChat,
-	baiduAI *BaiduAIChat,
-	dashScope *DashScopeChat,
-	xfyunAI *XFYunChat,
-	sn *SenseNovaChat,
-	tencentAI *TencentAIChat,
-	anthropicAI *AnthropicChat,
-	baichuanAI *BaichuanAIChat,
-	g360 *GPT360Chat,
-	one *OneAPIChat,
-) Chat {
+func NewChat(conf *config.Config, ai *AI) Chat {
 	var virtualImpl Chat
-	switch strings.ToLower(conf.VirtualModel.Implementation) {
+	impLowercase := strings.ToLower(conf.VirtualModel.Implementation)
+	switch impLowercase {
 	case "openai":
-		virtualImpl = openAI
+		virtualImpl = ai.OpenAI
 	case "baidu", "文心千帆":
-		virtualImpl = baiduAI
+		virtualImpl = ai.Baidu
 	case "dashscope", "灵积":
-		virtualImpl = dashScope
+		virtualImpl = ai.DashScope
 	case "xfyun", "讯飞星火":
-		virtualImpl = xfyunAI
+		virtualImpl = ai.Xfyun
 	case "sense_nova", "商汤日日新":
-		virtualImpl = sn
+		virtualImpl = ai.SenseNova
 	case "tencent", "腾讯":
-		virtualImpl = tencentAI
+		virtualImpl = ai.Tencent
 	case "anthropic":
-		virtualImpl = anthropicAI
+		virtualImpl = ai.Anthropic
 	case "baichuan", "百川":
-		virtualImpl = baichuanAI
+		virtualImpl = ai.Baichuan
 	case "gpt360", "360智脑":
-		virtualImpl = g360
+		virtualImpl = ai.GPT360
 	case "chatglm_turbo", "chatglm_pro", "chatglm_lite", "chatglm_std", "PaLM-2":
-		virtualImpl = one
+		virtualImpl = ai.OneAPI
+	case "google":
+		virtualImpl = ai.Google
+	case "sky":
+		virtualImpl = ai.Sky
 	default:
-		virtualImpl = openAI
+		if openrouter.SupportModel(impLowercase) {
+			virtualImpl = ai.Openrouter
+		} else {
+			virtualImpl = ai.OpenAI
+		}
 	}
 
 	return &Imp{
-		openAI:      openAI,
-		baiduAI:     baiduAI,
-		dashScope:   dashScope,
-		xfyunAI:     xfyunAI,
-		snAI:        sn,
-		tencentAI:   tencentAI,
-		anthropicAI: anthropicAI,
-		baichuanAI:  baichuanAI,
-		g360:        g360,
-		virtual:     NewVirtualChat(virtualImpl, conf.VirtualModel),
-		one:         one,
+		ai:      ai,
+		virtual: NewVirtualChat(virtualImpl, conf.VirtualModel),
 	}
 }
 
 func (ai *Imp) selectImp(model string) Chat {
 	if strings.HasPrefix(model, "灵积:") {
-		return ai.dashScope
+		return ai.ai.DashScope
 	}
 
 	if strings.HasPrefix(model, "文心千帆:") {
-		return ai.baiduAI
+		return ai.ai.Baidu
 	}
 
 	if strings.HasPrefix(model, "讯飞星火:") {
-		return ai.xfyunAI
+		return ai.ai.Xfyun
 	}
 
 	if strings.HasPrefix(model, "商汤日日新:") {
-		return ai.snAI
+		return ai.ai.SenseNova
 	}
 
 	if strings.HasPrefix(model, "腾讯:") {
-		return ai.tencentAI
+		return ai.ai.Tencent
 	}
 
 	if strings.HasPrefix(model, "Anthropic:") {
-		return ai.anthropicAI
+		return ai.ai.Anthropic
 	}
 
 	if strings.HasPrefix(model, "百川:") {
-		return ai.baichuanAI
+		return ai.ai.Baichuan
 	}
 
 	if strings.HasPrefix(model, "virtual:") {
@@ -305,11 +311,23 @@ func (ai *Imp) selectImp(model string) Chat {
 	}
 
 	if strings.HasPrefix(model, "360智脑:") {
-		return ai.g360
+		return ai.ai.GPT360
 	}
 
 	if strings.HasPrefix(model, "oneapi:") {
-		return ai.one
+		return ai.ai.OneAPI
+	}
+
+	if strings.HasPrefix(model, "google:") {
+		return ai.ai.Google
+	}
+
+	if strings.HasPrefix(model, "openrouter:") {
+		return ai.ai.Openrouter
+	}
+
+	if strings.HasPrefix(model, "sky:") {
+		return ai.ai.Sky
 	}
 
 	// TODO 根据模型名称判断使用哪个 AI
@@ -324,40 +342,49 @@ func (ai *Imp) selectImp(model string) Chat {
 		baidu.ModelLlama2_7b_CN,
 		baidu.ModelLlama2_70b:
 		// 百度文心千帆
-		return ai.baiduAI
+		return ai.ai.Baidu
 	case dashscope.ModelQWenV1, dashscope.ModelQWenPlusV1,
 		dashscope.ModelQWen7BV1, dashscope.ModelQWen7BChatV1,
+		dashscope.ModelQWenMax, dashscope.ModelQWenMaxLongContext, dashscope.ModelQWenVLPlus,
 		dashscope.ModelQWenTurbo, dashscope.ModelQWenPlus, dashscope.ModelBaiChuan7BChatV1,
 		dashscope.ModelQWen7BChat, dashscope.ModelQWen14BChat:
 		// 阿里灵积平台
-		return ai.dashScope
+		return ai.ai.DashScope
 	case string(xfyun.ModelGeneralV1_5), string(xfyun.ModelGeneralV2), string(xfyun.ModelGeneralV3):
 		// 讯飞星火
-		return ai.xfyunAI
+		return ai.ai.Xfyun
 	case string(sensenova.ModelNovaPtcXLV1), string(sensenova.ModelNovaPtcXSV1):
 		// 商汤日日新
-		return ai.snAI
+		return ai.ai.SenseNova
 	case tencentai.ModelHyllm:
 		// 腾讯混元大模型
-		return ai.tencentAI
+		return ai.ai.Tencent
 	case string(anthropic.ModelClaude2), string(anthropic.ModelClaudeInstant):
 		// Anthropic
-		return ai.anthropicAI
+		return ai.ai.Anthropic
 	case baichuan.ModelBaichuan2_53B:
 		// 百川
-		return ai.baichuanAI
+		return ai.ai.Baichuan
 	case gpt360.Model360GPT_S2_V9:
 		// 360智脑
-		return ai.g360
+		return ai.ai.GPT360
 	case ModelNanXian, ModelBeiChou:
 		// 虚拟模型
 		return ai.virtual
 	case "chatglm_turbo", "chatglm_pro", "chatglm_lite", "chatglm_std", "PaLM-2":
 		// oneapi
-		return ai.one
+		return ai.ai.OneAPI
+	case google.ModelGeminiPro, google.ModelGeminiProVision:
+		return ai.ai.Google
+	case sky.ModelSkyChatMegaVerse:
+		return ai.ai.Sky
+	default:
+		if openrouter.SupportModel(model) {
+			return ai.ai.Openrouter
+		}
 	}
 
-	return ai.openAI
+	return ai.ai.OpenAI
 }
 
 func (ai *Imp) Chat(ctx context.Context, req Request) (*Response, error) {

@@ -21,6 +21,11 @@ var coinTables = map[string]CoinTable{
 		"dall-e-2": 20,
 	},
 
+	"video": {
+		"default":                  200,
+		"stability-image-to-video": 200,
+	},
+
 	"openai": {
 		// 1000 Token 计费
 		"gpt-3.5-turbo":          3,   // valid $0.002/1K tokens -> ¥0.014/1K tokens
@@ -59,6 +64,9 @@ var coinTables = map[string]CoinTable{
 		"baichuan2-7b-chat-v1": 2, // valid 百川2 7b ¥0.006/1K tokens
 		"qwen-7b-chat":         2, // valid 通义千问 7b ¥0.006/1K tokens
 		"qwen-14b-chat":        2, // valid 通义千问 14b ¥0.008/1K tokens
+		"qwen-max":             1, // 官方限时免费
+		"qwen-max-longcontext": 1, // 官方限时免费
+		"qwen-vl-plus":         1, // 官方限时免费
 
 		// 讯飞星火 https://xinghuo.xfyun.cn/sparkapi
 		"generalv3": 5, // valid 讯飞星火 v3    ¥0.036/1K tokens
@@ -86,6 +94,15 @@ var coinTables = map[string]CoinTable{
 		"chatglm_lite":  1, // valid ¥0.004/1K tokens
 		// Google
 		"PaLM-2": 3, // valid ¥0.0148/1K tokens
+		//https://ai.google.dev/pricing?hl=zh-cn
+		"gemini-pro":        3, // 临时价格
+		"gemini-pro-vision": 5, // 临时价格
+
+		// OpenRouter
+		"01-ai.yi-34b-chat": 1, // valid ¥0.006/1K tokens
+
+		// 天工 https://model-platform.tiangong.cn/pricing
+		"SkyChat-MegaVerse": 2, // valid ¥0.01/1K tokens
 	},
 
 	"voice-recognition": {
@@ -179,6 +196,27 @@ func GetUnifiedImageGenCoins(model string) int {
 	}
 
 	return int(coinTables["image"]["default"])
+}
+
+// GetImageGenCoinsExcept 获取除了指定价格的所有图片生成模型
+func GetImageGenCoinsExcept(coins int64) map[string]int64 {
+	coinsTable := make(map[string]int64)
+	for model, price := range coinTables["image"] {
+		if price != coins {
+			coinsTable[model] = price
+		}
+	}
+
+	return coinsTable
+}
+
+// GetUnifiedVideoGenCoins 统一的视频生成计费
+func GetUnifiedVideoGenCoins(model string) int {
+	if price, ok := coinTables["video"][model]; ok {
+		return int(price)
+	}
+
+	return int(coinTables["video"]["default"])
 }
 
 func GetTextToVoiceCoins(model string, wordCount int) int64 {
